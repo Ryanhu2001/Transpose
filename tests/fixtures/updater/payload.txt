@@ -1,0 +1,1 @@
+Transpose signed update verification fixture.

@@ -1,0 +1,2 @@
+"NSScreenCaptureUsageDescription" = "Recognize text in the area you select. OCR runs on your Mac; screenshots are not uploaded.";
+"NSAccessibilityUsageDescription" = "Read text you select in other apps and display a small translation button nearby.";

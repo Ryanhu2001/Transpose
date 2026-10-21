@@ -1,0 +1,185 @@
+name: Windows
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Verify and build · Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/.build/windows-target
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustc --version
+          cargo --version
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Restore Rust build cache
+        id: rust-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            .build/windows-target
+          key: windows-x64-${{ hashFiles('src-tauri/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            windows-x64-${{ hashFiles('src-tauri/Cargo.lock') }}-
+            windows-x64-
+
+      - name: Verify frontend
+        run: npm run typecheck && npm test && npm run build
+
+      - name: Test Windows backend
+        run: cargo test --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc --locked
+
+      - name: Build Windows installer
+        run: |
+          Remove-Item -LiteralPath "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/bundle" -Recurse -Force -ErrorAction SilentlyContinue
+          npm run tauri -- build --target x86_64-pc-windows-msvc --bundles nsis --ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Ensure WebView2 runtime
+        run: |
+          $runtimePaths = @(
+            "${env:ProgramFiles(x86)}/Microsoft/EdgeWebView/Application/*/msedgewebview2.exe",
+            "$env:ProgramFiles/Microsoft/EdgeWebView/Application/*/msedgewebview2.exe",
+            "$env:LOCALAPPDATA/Microsoft/EdgeWebView/Application/*/msedgewebview2.exe"
+          )
+          $runtime = Get-Item -Path $runtimePaths -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $runtime) {
+            $bootstrapper = Join-Path $env:RUNNER_TEMP "MicrosoftEdgeWebview2Setup.exe"
+            Invoke-WebRequest "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutFile $bootstrapper
+            $installation = Start-Process -FilePath $bootstrapper -ArgumentList @("/silent", "/install") -Wait -PassThru
+            if ($installation.ExitCode -notin @(0, 3010)) {
+              throw "WebView2 installation failed with code $($installation.ExitCode)."
+            }
+          }
+
+      - name: Smoke test the built app
+        run: |
+          ./scripts/test-windows-smoke.ps1 `
+            -ExecutablePath "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/transpose.exe" `
+            -OutputDirectory ".build/windows-smoke/built"
+
+      - name: Test translation window dragging and controls
+        run: |
+          ./scripts/test-windows-result.ps1 `
+            -ExecutablePath "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/transpose.exe" `
+            -OutputDirectory ".build/windows-smoke/result"
+
+      - name: Install and smoke test the packaged app
+        run: |
+          $installers = @(Get-ChildItem "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe")
+          if ($installers.Count -ne 1) { throw 'Expected exactly one Windows installer.' }
+          $installer = $installers[0]
+          $installDirectory = Join-Path $env:GITHUB_WORKSPACE ".build/windows-installed"
+          $installation = Start-Process -FilePath $installer.FullName -ArgumentList @("/S", "/D=$installDirectory") -Wait -PassThru
+          if ($installation.ExitCode -ne 0) { throw "Installer exited with code $($installation.ExitCode)." }
+          ./scripts/test-windows-smoke.ps1 `
+            -ExecutablePath (Join-Path $installDirectory "transpose.exe") `
+            -OutputDirectory ".build/windows-smoke/installed"
+
+      - name: Collect installer and checksums
+        run: |
+          $version = (Get-Content VERSION -Raw).Trim()
+          $artifacts = Join-Path $env:GITHUB_WORKSPACE ".build/windows-artifacts"
+          New-Item -Path $artifacts -ItemType Directory -Force | Out-Null
+          $installers = @(Get-ChildItem "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe")
+          if ($installers.Count -ne 1) { throw 'Expected exactly one Windows installer.' }
+          $installer = $installers[0]
+          $productVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($installer.FullName).ProductVersion
+          if ($productVersion -notin @($version, "$version.0")) { throw 'Installer product version differs from VERSION.' }
+          $name = "Transpose-$version-Windows-x64-setup.exe"
+          Copy-Item -LiteralPath $installer.FullName -Destination (Join-Path $artifacts $name)
+          $hash = (Get-FileHash (Join-Path $artifacts $name) -Algorithm SHA256).Hash.ToLowerInvariant()
+          [System.IO.File]::WriteAllText((Join-Path $artifacts 'windows.json'), (@{
+            version = $version
+            productVersion = $productVersion
+            architecture = 'x64'
+            sha256 = $hash
+          } | ConvertTo-Json))
+          [System.IO.File]::WriteAllText((Join-Path $artifacts "SHA256SUMS.txt"), "$hash  $name`n")
+          [System.IO.File]::WriteAllText((Join-Path $artifacts "build.json"), (@{
+            version = $version
+            commit = $env:GITHUB_SHA
+            target = "x86_64-pc-windows-msvc"
+            signed = $false
+            release = $false
+          } | ConvertTo-Json))
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Transpose-Windows-x64
+          path: .build/windows-artifacts/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Ensure English OCR capability
+        run: |
+          $capabilityName = "Language.OCR~~~en-US~0.0.1.0"
+          $capability = Get-WindowsCapability -Online -Name $capabilityName
+          if ($capability.State -ne "Installed") {
+            Add-WindowsCapability -Online -Name $capabilityName -ErrorAction Stop
+            $capability = Get-WindowsCapability -Online -Name $capabilityName
+            if ($capability.State -ne "Installed") {
+              throw "The runner does not have the English OCR capability."
+            }
+          }
+
+      - name: Test Windows screen capture, OCR and selection
+        run: |
+          ./scripts/test-windows-smoke.ps1 `
+            -ExecutablePath "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/transpose.exe" `
+            -Mode Platform `
+            -OutputDirectory ".build/windows-smoke/platform" `
+            -TimeoutSeconds 90
+
+      - name: Upload smoke test reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Windows-smoke-reports
+          path: .build/windows-smoke/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Save Rust build cache
+        if: always() && !cancelled() && steps.rust-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            .build/windows-target
+          key: windows-x64-${{ hashFiles('src-tauri/Cargo.lock') }}-${{ github.sha }}

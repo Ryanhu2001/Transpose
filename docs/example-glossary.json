@@ -1,0 +1,26 @@
+[
+  {
+    "source": "environment scaling",
+    "translation": "环境扩展",
+    "note": "AI agent research",
+    "enabled": true
+  },
+  {
+    "source": "trajectory",
+    "translation": "轨迹",
+    "note": "An agent's sequence of observations and actions",
+    "enabled": true
+  },
+  {
+    "source": "ground truth",
+    "translation": "真实标注",
+    "note": "Dataset annotations; choose the sense appropriate to the context",
+    "enabled": true
+  },
+  {
+    "source": "API",
+    "translation": "API",
+    "note": "Preserve this abbreviation",
+    "enabled": true
+  }
+]

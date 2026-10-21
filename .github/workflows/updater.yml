@@ -1,0 +1,239 @@
+name: Prepare signed updates
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag (v followed by VERSION)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: updater-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      commit: ${{ steps.release.outputs.commit }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+      - name: Check signing key and existing tag
+        id: release
+        env:
+          UPDATER_TAG: ${{ inputs.tag }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]; then
+            echo '::error::Configure the TAURI_SIGNING_PRIVATE_KEY repository secret before preparing updates. Its public key must match plugins.updater.pubkey.'
+            exit 1
+          fi
+          unset TAURI_SIGNING_PRIVATE_KEY
+          node --input-type=module <<'NODE'
+          import { execFileSync } from 'node:child_process';
+          import { appendFileSync, readFileSync } from 'node:fs';
+          import { validateVersion } from './scripts/update-manifest.mjs';
+          const version = validateVersion(readFileSync('VERSION', 'utf8').trim());
+          if (process.env.UPDATER_TAG !== `v${version}`) throw new Error('Tag must be v followed by VERSION.');
+          for (const file of ['package.json', 'src-tauri/tauri.conf.json']) {
+            if (JSON.parse(readFileSync(file, 'utf8')).version !== version) throw new Error(`${file} differs from VERSION.`);
+          }
+          const cargo = readFileSync('src-tauri/Cargo.toml', 'utf8').match(/^\[package\]\s*\n([\s\S]*?)(?=^\[|$(?![\s\S]))/m)?.[1];
+          if (cargo?.match(/^version\s*=\s*"([^"]+)"/m)?.[1] !== version) throw new Error('Cargo package version differs from VERSION.');
+          const commit = execFileSync('git', ['rev-parse', `refs/tags/${process.env.UPDATER_TAG}^{commit}`], { encoding: 'utf8' }).trim();
+          if (execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim() !== commit) throw new Error('Checkout does not match the existing tag.');
+          appendFileSync(process.env.GITHUB_OUTPUT, `version=${version}\ncommit=${commit}\n`);
+          NODE
+      - run: npm ci
+      - name: Test manifest preparation
+        run: node --test scripts/test-update-manifest.mjs
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-26
+            target: aarch64-apple-darwin
+            artifact: macOS-arm64
+            target-dir: .build/updater-target
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: Windows-x64
+            target-dir: .build/windows-target
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/${{ matrix.target-dir }}
+      UPDATER_VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+      - name: Set up Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --target '${{ matrix.target }}'
+          rustup default stable
+      - name: Restore Windows Rust build cache
+        if: runner.os == 'Windows'
+        id: windows-rust-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            .build/windows-target
+          key: windows-x64-${{ hashFiles('src-tauri/Cargo.lock') }}-${{ needs.validate.outputs.commit }}
+          restore-keys: |
+            windows-x64-${{ hashFiles('src-tauri/Cargo.lock') }}-
+            windows-x64-
+      - name: Check macOS toolchain
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          PROJECT_DIR="$GITHUB_WORKSPACE"
+          source scripts/common.sh
+          transpose_check_toolchain
+      - run: npm ci
+      - name: Build signed updater artifacts
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "${TAURI_SIGNING_PRIVATE_KEY:-}" || { echo '::error::Missing updater signing key.'; exit 1; }
+          unset APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID APPLE_API_KEY APPLE_API_ISSUER APPLE_API_KEY_PATH
+          export APPLE_SIGNING_IDENTITY=-
+          rm -rf "$CARGO_TARGET_DIR/${{ matrix.target }}/release/bundle"
+          if [[ '${{ runner.os }}' == macOS ]]; then bundle=app; else bundle=nsis; fi
+          npm run tauri -- build --target '${{ matrix.target }}' --bundles "$bundle" --config src-tauri/tauri.updater.conf.json --ci
+      - name: Install and smoke test the signed Windows package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installers = @(Get-ChildItem "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe")
+          if ($installers.Count -ne 1) { throw 'Expected exactly one Windows installer.' }
+          if (-not (Test-Path -LiteralPath "$($installers[0].FullName).sig" -PathType Leaf)) { throw 'The installer has no updater signature.' }
+          $installDirectory = Join-Path $env:GITHUB_WORKSPACE '.build/updater-installed'
+          $installation = Start-Process -FilePath $installers[0].FullName -ArgumentList @('/S', "/D=$installDirectory") -Wait -PassThru
+          if ($installation.ExitCode -ne 0) { throw "Installer exited with code $($installation.ExitCode)." }
+          $executable = Join-Path $installDirectory 'transpose.exe'
+          ./scripts/test-windows-smoke.ps1 -ExecutablePath $executable -OutputDirectory '.build/updater-smoke/installed'
+      - name: Upload Windows package smoke report
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: updater-Windows-smoke-report
+          path: .build/updater-smoke/
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Collect macOS updater
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle="$CARGO_TARGET_DIR/aarch64-apple-darwin/release/bundle/macos"
+          test "$(lipo -archs "$bundle/Transpose.app/Contents/MacOS/transpose")" = arm64
+          codesign --verify --deep --strict "$bundle/Transpose.app"
+          destination=".build/updater-artifacts/Transpose-$UPDATER_VERSION-macOS-arm64.app.tar.gz"
+          mkdir -p .build/updater-artifacts
+          cp "$bundle/Transpose.app.tar.gz" "$destination"
+          cp "$bundle/Transpose.app.tar.gz.sig" "$destination.sig"
+      - name: Collect Windows updater
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installers = @(Get-ChildItem "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe")
+          if ($installers.Count -ne 1) { throw 'Expected one signed updater installer.' }
+          $installer = $installers[0]
+          $productVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($installer.FullName).ProductVersion
+          if ($productVersion -notin @($env:UPDATER_VERSION, "$env:UPDATER_VERSION.0")) { throw 'Installer product version differs from VERSION.' }
+          $artifacts = Join-Path $env:GITHUB_WORKSPACE '.build/updater-artifacts'
+          New-Item -Path $artifacts -ItemType Directory -Force | Out-Null
+          $destination = Join-Path $artifacts "Transpose-$env:UPDATER_VERSION-Windows-x64-setup.exe"
+          Copy-Item -LiteralPath $installer.FullName -Destination $destination
+          Copy-Item -LiteralPath "$($installer.FullName).sig" -Destination "$destination.sig"
+          $metadata = @{ version = $env:UPDATER_VERSION; productVersion = $productVersion; architecture = 'x64'; sha256 = (Get-FileHash $destination -Algorithm SHA256).Hash.ToLowerInvariant() }
+          [IO.File]::WriteAllText((Join-Path $artifacts 'windows.json'), ($metadata | ConvertTo-Json))
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: signed-updater-${{ matrix.artifact }}
+          path: .build/updater-artifacts/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Save Windows Rust build cache
+        if: always() && !cancelled() && runner.os == 'Windows' && steps.windows-rust-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            .build/windows-target
+          key: windows-x64-${{ hashFiles('src-tauri/Cargo.lock') }}-${{ needs.validate.outputs.commit }}
+
+  manifest:
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    env:
+      UPDATER_VERSION: ${{ needs.validate.outputs.version }}
+      UPDATER_TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: signed-updater-*
+          merge-multiple: true
+          path: .build/updater-artifacts/
+      - name: Prepare release files
+        run: |
+          set -euo pipefail
+          mkdir -p .build/release-ready
+          node scripts/update-manifest.mjs \
+            --version "$UPDATER_VERSION" --tag "$UPDATER_TAG" \
+            --base-url "https://github.com/$GITHUB_REPOSITORY/releases/download/$UPDATER_TAG/" \
+            --macos ".build/updater-artifacts/Transpose-$UPDATER_VERSION-macOS-arm64.app.tar.gz" \
+            --windows ".build/updater-artifacts/Transpose-$UPDATER_VERSION-Windows-x64-setup.exe" \
+            --windows-metadata .build/updater-artifacts/windows.json \
+            --output .build/release-ready/latest.json
+          cp .build/updater-artifacts/*.app.tar.gz* .build/updater-artifacts/*-setup.exe* .build/release-ready/
+          cd .build/release-ready
+          sha256sum *.app.tar.gz* *-setup.exe* latest.json > SHA256SUMS.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Transpose-signed-updates-${{ needs.validate.outputs.version }}
+          path: .build/release-ready/
+          if-no-files-found: error
+          retention-days: 14
