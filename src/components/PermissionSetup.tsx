@@ -16,7 +16,7 @@ export function PermissionSetup({
     client.state!.app.permissions.screenRecordingNeedsRestart,
   );
   const [previewReopened, setPreviewReopened] = useState(false);
-  if (!setup.visible) return null;
+  if (client.state!.app.platform === "windows" || !setup.visible) return null;
 
   return (
     <section

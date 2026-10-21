@@ -5,12 +5,14 @@ import {
   Crop,
   ExternalLink,
   Languages,
+  Monitor,
   Play,
   ShieldCheck,
   Sparkles,
 } from "lucide-react";
 import { useState } from "react";
 import { PermissionSetup } from "./PermissionSetup";
+import { platformFeatures } from "../lib/platform";
 import type { NativeClient } from "../lib/useNative";
 import {
   Busy,
@@ -31,6 +33,7 @@ export function General({
   onServices: () => void;
 }) {
   const app = client.state!.app;
+  const features = platformFeatures(app);
   const [sample, setSample] = useState(
     "Good translation carries the thought, not just the words.",
   );
@@ -56,13 +59,21 @@ export function General({
       >
         <SettingRow
           title={t("Selection Translation", "划词翻译")}
-          description={t(
-            "Select text in any app. One small button appears.",
-            "在应用中选中文字，即可看到轻巧的翻译按钮。",
-          )}
+          description={
+            features.isWindows
+              ? t(
+                  "Select text in supported apps to reveal one small button.",
+                  "在支持划词的应用中选中文字，即可看到翻译按钮。",
+                )
+              : t(
+                  "Select text in any app. One small button appears.",
+                  "在应用中选中文字，即可看到轻巧的翻译按钮。",
+                )
+          }
         >
           <Toggle
             value={app.settings.automaticSelection}
+            disabled={!features.selection}
             onChange={(automaticSelection) =>
               client.act("update_settings", { automaticSelection })
             }
@@ -76,9 +87,10 @@ export function General({
             "自由圈住文字，松开即可翻译。",
           )}
         >
-          <kbd>⌥ S</kbd>
+          <kbd>{features.captureShortcut}</kbd>
           <button
             className="button subtle"
+            disabled={!features.screenCapture || !features.ocr}
             onClick={() => client.act("capture")}
           >
             <Crop size={15} />
@@ -123,7 +135,7 @@ export function General({
           <p className="row-description">
             {t(
               "Start Transpose at login and keep translation a gesture away.",
-              "登录 Mac 时启动 Transpose，让翻译随手可用。",
+              "登录电脑时启动 Transpose，让翻译随手可用。",
             )}
           </p>
           {app.loginItem.status === "requiresApproval" && (
@@ -148,10 +160,15 @@ export function General({
           )}
           {app.loginItem.status === "notFound" && (
             <p className="row-description">
-              {t(
-                "Move Transpose to Applications, then reopen it.",
-                "请将 Transpose 放入“应用程序”后重新打开。",
-              )}
+              {features.isWindows
+                ? t(
+                    "Install Transpose, then reopen it to enable startup.",
+                    "请先安装 Transpose，再重新打开以启用开机启动。",
+                  )
+                : t(
+                    "Move Transpose to Applications, then reopen it.",
+                    "请将 Transpose 放入“应用程序”后重新打开。",
+                  )}
             </p>
           )}
           {app.loginItem.problem && (
@@ -210,53 +227,105 @@ export function General({
       <section className="section permissions">
         <div className="section-heading">
           <h2>
-            <ShieldCheck size={16} />
-            {t("Permissions", "系统权限")}
+            {features.isWindows ? (
+              <Monitor size={16} />
+            ) : (
+              <ShieldCheck size={16} />
+            )}
+            {features.isWindows
+              ? t("Windows Integration", "Windows 系统集成")
+              : t("Permissions", "系统权限")}
           </h2>
           <span className="quiet">{t("You stay in control", "由你决定")}</span>
         </div>
         <div className="card settings-card">
-          {(["accessibility", "screenRecording"] as const).map((kind) => {
-            const allowed = app.permissions[kind];
-            return (
+          {features.isWindows ? (
+            <>
               <SettingRow
-                key={kind}
-                title={
-                  kind === "accessibility"
-                    ? t("Accessibility", "辅助功能")
-                    : t("Screen Recording", "屏幕录制")
-                }
+                title={t("Text Selection", "选中文字")}
+                description={t(
+                  "Uses Windows UI Automation. For apps without text selection support, use screen translation.",
+                  "通过 Windows UI 自动化读取文字；应用不支持划词时，可使用圈选翻译。",
+                )}
+              >
+                <span className="integration-status">
+                  {features.selection && <CheckCircle2 size={14} />}
+                  {features.selection
+                    ? t("Ready", "已就绪")
+                    : t("Unavailable", "暂不可用")}
+                </span>
+              </SettingRow>
+              <SettingRow
+                title={t("Screen Capture & OCR", "屏幕圈选与文字识别")}
                 description={
-                  kind === "accessibility"
-                    ? t(
-                        "Read text you select across apps.",
-                        "读取其他应用中选中的文字。",
-                      )
-                    : t(
-                        "Recognize text in the area you draw.",
-                        "识别圈选区域中的文字。",
-                      )
+                  app.capabilities?.ocrStatus ||
+                  t(
+                    "Windows recognizes text locally using your installed OCR languages.",
+                    "使用 Windows 已安装的 OCR 语言，在本机识别文字。",
+                  )
                 }
               >
-                <button
-                  className={`button ${allowed ? "permission-ok" : "subtle"}`}
-                  onClick={() => client.act("permission", { kind })}
-                >
-                  {allowed ? (
+                <span className="integration-status">
+                  {features.screenCapture && features.ocr && (
                     <CheckCircle2 size={14} />
-                  ) : (
-                    <ExternalLink size={13} />
                   )}
-                  {allowed ? t("Allowed", "已允许") : t("Allow", "授权")}
-                </button>
+                  {features.screenCapture && features.ocr
+                    ? t("Ready", "已就绪")
+                    : t("Setup needed", "需要设置")}
+                </span>
               </SettingRow>
-            );
-          })}
+            </>
+          ) : (
+            (["accessibility", "screenRecording"] as const).map((kind) => {
+              const allowed = app.permissions[kind];
+              return (
+                <SettingRow
+                  key={kind}
+                  title={
+                    kind === "accessibility"
+                      ? t("Accessibility", "辅助功能")
+                      : t("Screen Recording", "屏幕录制")
+                  }
+                  description={
+                    kind === "accessibility"
+                      ? t(
+                          "Read text you select across apps.",
+                          "读取其他应用中选中的文字。",
+                        )
+                      : t(
+                          "Recognize text in the area you draw.",
+                          "识别圈选区域中的文字。",
+                        )
+                  }
+                >
+                  <button
+                    className={`button ${allowed ? "permission-ok" : "subtle"}`}
+                    onClick={() => client.act("permission", { kind })}
+                  >
+                    {allowed ? (
+                      <CheckCircle2 size={14} />
+                    ) : (
+                      <ExternalLink size={13} />
+                    )}
+                    {allowed ? t("Allowed", "已允许") : t("Allow", "授权")}
+                  </button>
+                </SettingRow>
+              );
+            })
+          )}
         </div>
+        {features.isWindows && !features.ocr && (
+          <p className="footnote">
+            {t(
+              "Install an OCR language in Windows Settings → Time & language → Language & region, then reopen Transpose.",
+              "请在 Windows 设置 → 时间和语言 → 语言和区域中安装文字识别语言，然后重新打开 Transpose。",
+            )}
+          </p>
+        )}
         <p className="footnote">
           <Command size={12} />
           {t(
-            "Screenshots and OCR stay on your Mac. Online services receive text only.",
+            "Screenshots and OCR stay on your device. Online services receive text only.",
             "截图与文字识别在本机完成，在线服务仅接收文字。",
           )}
         </p>

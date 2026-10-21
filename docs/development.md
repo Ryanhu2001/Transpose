@@ -1,6 +1,6 @@
 # Development
 
-The app uses Tauri + TypeScript with a Swift macOS bridge.
+The app uses Tauri + TypeScript, a Swift macOS bridge and a Rust Windows backend.
 
 ## Toolchain
 
@@ -43,6 +43,21 @@ open dist/Transpose.app
 - `npm run dev`: browser frontend only. `?preview=1` displays explicitly marked sample data without native access.
 
 Build scripts use project-local caches under `.build/`. Builds do not grant privacy permissions, enable login startup or notarize the app.
+
+## Windows builds
+
+Windows builds are experimental. Use Windows 10/11 x64, Node.js **22.14+**, stable Rust with the MSVC toolchain, Visual Studio C++ Build Tools and WebView2. Apple Translation and the Swift bridge remain macOS-only.
+
+```powershell
+npm ci
+npm run typecheck
+npm test
+npm run build
+cargo test --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc --locked
+npm run tauri -- build --target x86_64-pc-windows-msvc --bundles nsis --ci
+```
+
+Tauri merges `src-tauri/tauri.windows.conf.json` automatically. The Windows workflow builds an unsigned NSIS installer, tests the built and installed app, and uploads checksums and diagnostic reports as CI artifacts. It does not publish a release. Separate offline platform checks cover screen capture, OCR, freeform filtering and selection. Real mouse interaction and multiple displays still need Windows acceptance testing.
 
 ## Verification
 

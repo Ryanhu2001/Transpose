@@ -8,15 +8,28 @@ import {
   Settings2,
   X,
 } from "lucide-react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useEffect, useState } from "react";
 import type { NativeClient } from "../lib/useNative";
 import { Brand, type Translator } from "./common";
 export function Result({ client, t }: { client: NativeClient; t: Translator }) {
   const result = client.state?.result;
+  const isWindows = client.state?.app.platform === "windows";
   const [copied, setCopied] = useState(false);
+  const [windowError, setWindowError] = useState("");
   useEffect(() => {
     setCopied(false);
   }, [result?.id, result?.output]);
+  useEffect(() => {
+    if (!isWindows) return;
+    const close = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      client.act("result_close");
+    };
+    window.addEventListener("keydown", close);
+    return () => window.removeEventListener("keydown", close);
+  }, [client.act, isWindows]);
   const copy = async () => {
     try {
       await client.request("result_copy");
@@ -28,7 +41,7 @@ export function Result({ client, t }: { client: NativeClient; t: Translator }) {
   };
   return (
     <div className="result-shell">
-      <header className="result-header">
+      <header className="result-header" data-tauri-drag-region="deep">
         <div className="result-direction">
           <Brand small />
           <span>
@@ -99,9 +112,9 @@ export function Result({ client, t }: { client: NativeClient; t: Translator }) {
             )}
           </div>
         )}
-        {client.error && (
+        {(client.error || windowError) && (
           <p className="result-error" role="alert">
-            {client.error}
+            {client.error || windowError}
           </p>
         )}
       </main>
@@ -139,6 +152,29 @@ export function Result({ client, t }: { client: NativeClient; t: Translator }) {
           </button>
         </div>
       </footer>
+      {isWindows && (
+        <button
+          className="result-resize-handle"
+          aria-label={t("Resize translation window", "调整译文窗口大小")}
+          tabIndex={-1}
+          onPointerDown={(event) => {
+            if (event.button !== 0 || client.mode !== "tauri") return;
+            event.preventDefault();
+            setWindowError("");
+            void getCurrentWindow()
+              .startResizeDragging("SouthEast")
+              .catch(() =>
+                setWindowError(
+                  t("Unable to resize this window.", "暂时无法调整窗口大小。"),
+                ),
+              );
+          }}
+        >
+          <svg viewBox="0 0 16 16" aria-hidden="true">
+            <path d="M5 13 13 5M10 13l3-3" />
+          </svg>
+        </button>
+      )}
     </div>
   );
 }

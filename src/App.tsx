@@ -27,7 +27,8 @@ export default function App() {
     document.documentElement.lang =
       app?.locale === "zh-Hans" ? "zh-Hans" : "en";
     document.body.dataset.route = isResult ? "result" : "settings";
-  }, [app?.locale, isResult]);
+    document.body.dataset.platform = app?.platform ?? "macos";
+  }, [app?.locale, app?.platform, isResult]);
   if (isResult) return <Result client={client} t={t} />;
   if (!app)
     return (
@@ -114,7 +115,7 @@ export default function App() {
               <strong>{t("Demo mode", "演示模式")}</strong>
               <span>
                 {t(
-                  "Local preview only. No macOS services or network connections.",
+                  "Local preview only. No system services or network connections.",
                   "仅为本地预览，不调用系统服务或网络。",
                 )}
               </span>

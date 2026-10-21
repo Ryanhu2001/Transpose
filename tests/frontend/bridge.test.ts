@@ -277,7 +277,7 @@ describe("browser and preview boundaries", () => {
 
       expect(transport.mode).toBe("unavailable");
       await expect(transport.request("snapshot")).rejects.toThrow(
-        "Open Transpose on your Mac",
+        "Open the Transpose app",
       );
       expect(fetch).not.toHaveBeenCalled();
       expect(vi.getTimerCount()).toBe(0);

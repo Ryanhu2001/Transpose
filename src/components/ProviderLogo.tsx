@@ -2,9 +2,9 @@ import { Server, Terminal } from "lucide-react";
 import deepseekLogo from "../assets/providers/deepseek.svg";
 import openrouterLogo from "../assets/providers/openrouter.svg";
 import openrouterDarkLogo from "../assets/providers/openrouter-dark.svg";
+import type { ServiceChannel } from "../lib/platform";
 
-export type ServiceChannel =
-  "apple" | "deepseek" | "openrouter" | "customAPI" | "localCLI";
+export type { ServiceChannel } from "../lib/platform";
 
 export function ProviderLogo({ channel }: { channel: ServiceChannel }) {
   if (channel === "apple")

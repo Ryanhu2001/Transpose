@@ -15,7 +15,8 @@ import {
 import { useEffect, useState } from "react";
 import type { NativeClient } from "../lib/useNative";
 import { preferredCLI } from "../lib/providers";
-import { ProviderLogo, type ServiceChannel } from "./ProviderLogo";
+import { platformFeatures, serviceChannels } from "../lib/platform";
+import { ProviderLogo } from "./ProviderLogo";
 import {
   Busy,
   Field,
@@ -23,13 +24,6 @@ import {
   StatusMessage,
   type Translator,
 } from "./common";
-const channels: ServiceChannel[] = [
-  "apple",
-  "deepseek",
-  "openrouter",
-  "customAPI",
-  "localCLI",
-];
 export function Services({
   client,
   t,
@@ -38,6 +32,8 @@ export function Services({
   t: Translator;
 }) {
   const app = client.state!.app;
+  const features = platformFeatures(app);
+  const channels = serviceChannels(app);
   const selected = app.settings.provider;
   const provider = app.providers.find((item) => item.id === selected)!;
   const [apiKey, setApiKey] = useState("");
@@ -113,14 +109,20 @@ export function Services({
         </span>
         <h1>{t("Translation Services", "翻译服务")}</h1>
         <p>
-          {t(
-            "Start on your Mac. Connect more when you need them.",
-            "从本机翻译开始，也可以连接你喜欢的服务。",
-          )}
+          {features.isWindows
+            ? t(
+                "Connect your preferred API or an installed command-line tool.",
+                "连接你喜欢的 API 服务，或使用已安装的本地命令行工具。",
+              )
+            : t(
+                "Start on your Mac. Connect more when you need them.",
+                "从本机翻译开始，也可以连接你喜欢的服务。",
+              )}
         </p>
       </header>
       <div
         className="provider-grid"
+        data-channels={channels.length}
         role="group"
         aria-label={t("Choose translation service", "选择翻译服务")}
       >
@@ -191,8 +193,8 @@ export function Services({
                           "连接兼容 OpenAI 的 API 服务。",
                         )
                       : t(
-                          "Use a CLI already installed on your Mac.",
-                          "使用 Mac 上已安装的命令行工具。",
+                          "Use a CLI already installed on your computer.",
+                          "使用电脑上已安装的命令行工具。",
                         )}
             </p>
           </div>
@@ -336,7 +338,10 @@ export function Services({
                   onChange={(event) => setCliPath(event.target.value)}
                   placeholder={
                     app.detectedCLIs.find((item) => item.provider === selected)
-                      ?.path || "/usr/local/bin/…"
+                      ?.path ||
+                    (features.isWindows
+                      ? "C:\\Users\\…\\codex.exe"
+                      : "/usr/local/bin/…")
                   }
                   spellCheck={false}
                   autoCapitalize="off"
@@ -391,7 +396,9 @@ export function Services({
                   {app.settings.keyIsSaved && (
                     <span className="saved-badge">
                       <Check size={11} />
-                      {t("In Keychain", "已存入钥匙串")}
+                      {features.isWindows
+                        ? t("Saved securely", "已安全保存")
+                        : t("In Keychain", "已存入钥匙串")}
                     </span>
                   )}
                 </div>
@@ -453,10 +460,15 @@ export function Services({
                 </div>
                 <p className="field-help">
                   <LockKeyhole size={11} />
-                  {t(
-                    "Stored in macOS Keychain. Never stored in this web interface.",
-                    "保存在 macOS 钥匙串中，网页界面不会保存 Key。",
-                  )}
+                  {features.isWindows
+                    ? t(
+                        "Stored in Windows Credential Manager. Never stored in this web interface.",
+                        "保存在 Windows 凭据管理器中，网页界面不会保存 Key。",
+                      )
+                    : t(
+                        "Stored in macOS Keychain. Never stored in this web interface.",
+                        "保存在 macOS 钥匙串中，网页界面不会保存 Key。",
+                      )}
                 </p>
                 <StatusMessage>{app.status.credential}</StatusMessage>
               </div>

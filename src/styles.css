@@ -554,6 +554,25 @@ select {
   gap: 8px;
   margin-bottom: 15px;
 }
+.provider-grid[data-channels="4"] {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+.integration-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--secondary);
+  font-size: 10px;
+  white-space: nowrap;
+}
+body[data-platform="windows"] {
+  font-family:
+    "Segoe UI Variable", "Segoe UI", "Microsoft YaHei UI", sans-serif;
+}
+html[lang="zh-Hans"] body[data-platform="windows"] {
+  font-family:
+    "Microsoft YaHei UI", "Segoe UI Variable", "Segoe UI", sans-serif;
+}
 .provider-choice {
   position: relative;
   display: flex;
@@ -998,12 +1017,32 @@ body[data-route="result"] {
   overflow: hidden;
 }
 .result-shell {
+  position: relative;
   display: flex;
   flex-direction: column;
   height: 100vh;
   min-width: 360px;
   overflow: hidden;
   background: var(--surface);
+}
+.result-resize-handle {
+  position: absolute;
+  right: 2px;
+  bottom: 2px;
+  width: 16px;
+  height: 16px;
+  padding: 1px;
+  color: var(--muted);
+  cursor: nwse-resize;
+  touch-action: none;
+}
+.result-resize-handle svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-width: 1.4;
 }
 .result-header {
   height: 44px;

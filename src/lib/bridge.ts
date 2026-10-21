@@ -130,7 +130,7 @@ export function createNativeTransport(): NativeTransport {
     mode: "unavailable",
     request: async () => {
       throw new Error(
-        "Open Transpose on your Mac to use this interface. For a local visual demo, add ?preview=1.",
+        "Open the Transpose app to use this interface. For a local visual demo, add ?preview=1.",
       );
     },
     subscribe: async () => () => {},

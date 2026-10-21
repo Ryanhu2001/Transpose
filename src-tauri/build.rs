@@ -16,9 +16,15 @@ fn swift_sources(directory: &Path, files: &mut Vec<PathBuf>) {
 }
 
 fn main() {
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
-        panic!("Transpose currently requires macOS native frameworks.");
+    match env::var("CARGO_CFG_TARGET_OS").as_deref() {
+        Ok("macos") => build_swift_bridge(),
+        Ok("windows") => {}
+        _ => panic!("Transpose currently supports macOS and Windows."),
     }
+    tauri_build::build();
+}
+
+fn build_swift_bridge() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let source = manifest.join("../native/Sources/TransposeNative");
     println!("cargo:rerun-if-changed={}", source.display());
@@ -110,5 +116,4 @@ fn main() {
         println!("cargo:rustc-link-lib=framework={framework}");
     }
     println!("cargo:rustc-link-arg=-Wl,-weak_framework,Translation");
-    tauri_build::build();
 }

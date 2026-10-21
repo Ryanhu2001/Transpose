@@ -11,24 +11,34 @@ import type {
 } from "./types";
 
 // This in-memory adapter is enabled only by the explicit ?preview=1 flag.
-// It does not access the network, credentials, disk, or macOS permissions.
+// It does not access the network, credentials, disk, or system permissions.
 export function createDemoTransport(): NativeTransport {
-  const english = new URLSearchParams(location.search).get("lang") !== "zh";
-  const previewPermissions = new URLSearchParams(location.search).get(
-    "permissions",
-  );
+  const params = new URLSearchParams(location.search);
+  const english = params.get("lang") !== "zh";
+  const windows = params.get("platform") === "windows";
+  const previewPermissions = params.get("permissions");
   const state: BridgeState = {
     app: {
       version: "0.6.0-dev",
+      platform: windows ? "windows" : "macos",
+      ...(windows
+        ? {
+            capabilities: {
+              selection: true,
+              screenCapture: true,
+              ocr: params.get("ocr") !== "missing",
+            },
+          }
+        : {}),
       language: english ? "english" : "simplifiedChinese",
       locale: english ? "en" : "zh-Hans",
       settings: {
-        provider: "apple",
+        provider: windows ? "deepseek" : "apple",
         target: "smart",
         automaticSelection: true,
         preferences: "",
-        baseURL: "",
-        model: "",
+        baseURL: windows ? "https://api.deepseek.com" : "",
+        model: windows ? "deepseek-flash" : "",
         cliPath: "",
         keyIsSaved: false,
       },
@@ -106,7 +116,7 @@ export function createDemoTransport(): NativeTransport {
       },
       loginItem: { status: "notRegistered" },
       apple: {
-        supported: true,
+        supported: !windows,
         status: english
           ? "Language packs are managed by macOS."
           : "语言包由 macOS 管理。",
@@ -141,7 +151,7 @@ export function createDemoTransport(): NativeTransport {
     loadingMessage: "",
     error: null,
     status: "Demo · no translation service was called",
-    provider: "Apple Translate",
+    provider: windows ? "DeepSeek" : "Apple Translate",
     isPinned: false,
     canRetry: true,
   });
@@ -202,7 +212,7 @@ export function createDemoTransport(): NativeTransport {
           break;
         case "permission":
           state.app.status.connection =
-            "Demo: macOS permissions cannot be changed here.";
+            "Demo: system permissions cannot be changed here.";
           break;
         case "login_set":
           state.app.loginItem.status = payload.enabled
@@ -247,7 +257,7 @@ export function createDemoTransport(): NativeTransport {
           break;
         case "capture":
           state.app.status.connection =
-            "Demo: screen capture is only available in the Mac app.";
+            "Demo: screen capture is only available in the desktop app.";
           break;
         default:
           break;

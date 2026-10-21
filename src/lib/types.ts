@@ -29,6 +29,14 @@ export interface Provider {
 }
 export interface AppSnapshot {
   version: string;
+  // Older macOS bridges omit platform and capabilities.
+  platform?: "macos" | "windows";
+  capabilities?: {
+    selection: boolean;
+    screenCapture: boolean;
+    ocr: boolean;
+    ocrStatus?: string;
+  };
   language: AppLanguage;
   locale: "en" | "zh-Hans";
   settings: {

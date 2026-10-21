@@ -8,14 +8,14 @@ body:
     id: version
     attributes:
       label: Transpose version / 版本
-      placeholder: 0.5.0
+      placeholder: 0.6.0
     validations:
       required: true
   - type: input
     id: environment
     attributes:
-      label: macOS version and Mac chip / 系统与芯片
-      placeholder: macOS 26.4, Apple M2
+      label: Operating system and architecture / 系统与架构
+      placeholder: macOS 26.4, Apple M2 / Windows 11, x64
     validations:
       required: true
   - type: input
