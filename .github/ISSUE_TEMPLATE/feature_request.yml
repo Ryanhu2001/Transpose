@@ -1,0 +1,16 @@
+name: Feature request / 功能建议
+description: Suggest an improvement for Transpose.
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What would this help you do? / 希望解决什么问题？
+      description: Describe a concrete reading or translation task.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed interaction / 期望如何使用？
+    validations:
+      required: true

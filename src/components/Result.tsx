@@ -1,0 +1,144 @@
+import {
+  Check,
+  Copy,
+  LoaderCircle,
+  Pin,
+  PinOff,
+  RotateCcw,
+  Settings2,
+  X,
+} from "lucide-react";
+import { useEffect, useState } from "react";
+import type { NativeClient } from "../lib/useNative";
+import { Brand, type Translator } from "./common";
+export function Result({ client, t }: { client: NativeClient; t: Translator }) {
+  const result = client.state?.result;
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    setCopied(false);
+  }, [result?.id, result?.output]);
+  const copy = async () => {
+    try {
+      await client.request("result_copy");
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1800);
+    } catch {
+      /* client displays error */
+    }
+  };
+  return (
+    <div className="result-shell">
+      <header className="result-header">
+        <div className="result-direction">
+          <Brand small />
+          <span>
+            {result?.sourceLanguage || t("Auto", "自动")}
+            <span className="direction-arrow">→</span>
+            <strong>
+              {result?.targetLanguage || t("Translation", "译文")}
+            </strong>
+          </span>
+        </div>
+        <div className="result-header-actions">
+          <button
+            className={`icon-button ${result?.isPinned ? "active" : ""}`}
+            aria-pressed={Boolean(result?.isPinned)}
+            aria-label={
+              result?.isPinned
+                ? t("Unpin window", "取消固定")
+                : t("Pin window", "固定窗口")
+            }
+            title={
+              result?.isPinned
+                ? t("Unpin window", "取消固定")
+                : t("Pin window", "固定窗口")
+            }
+            onClick={() =>
+              client.act("result_pin", { pinned: !result?.isPinned })
+            }
+          >
+            {result?.isPinned ? <PinOff size={15} /> : <Pin size={15} />}
+          </button>
+          <button
+            className="icon-button"
+            aria-label={t("Close", "关闭")}
+            onClick={() => client.act("result_close")}
+          >
+            <X size={17} />
+          </button>
+        </div>
+      </header>
+      <main className="result-content" tabIndex={0}>
+        {result?.error ? (
+          <p className="result-error" role="alert">
+            {result.error}
+          </p>
+        ) : result?.output ? (
+          <div className="translation-output">
+            {result.output}
+            {result.isLoading && (
+              <span
+                className="stream-cursor"
+                aria-label={t("Translating", "翻译中")}
+              />
+            )}
+          </div>
+        ) : (
+          <div className="result-loading">
+            {result?.isLoading ? (
+              <>
+                <LoaderCircle className="spin" size={17} />
+                <span>
+                  {result.loadingMessage || t("Translating…", "正在翻译…")}
+                </span>
+              </>
+            ) : (
+              <span>
+                {t("Your translation will appear here.", "译文将在这里显示。")}
+              </span>
+            )}
+          </div>
+        )}
+        {client.error && (
+          <p className="result-error" role="alert">
+            {client.error}
+          </p>
+        )}
+      </main>
+      <footer className="result-footer">
+        <span className="result-status" title={result?.status}>
+          {client.mode === "demo"
+            ? "Demo · local preview"
+            : result?.status || result?.provider || ""}
+        </span>
+        <div className="result-tools">
+          <button
+            className="icon-button"
+            disabled={!result?.canRetry || result.isLoading}
+            onClick={() => client.act("result_retry")}
+            aria-label={t("Translate again", "重新翻译")}
+            title={t("Translate again", "重新翻译")}
+          >
+            <RotateCcw size={14} />
+          </button>
+          <button
+            className="icon-button"
+            onClick={() => client.act("open_settings")}
+            aria-label={t("Settings", "设置")}
+            title={t("Settings", "设置")}
+          >
+            <Settings2 size={15} />
+          </button>
+          <button
+            className="button copy-button"
+            disabled={!result?.output}
+            onClick={() => void copy()}
+          >
+            {copied ? <Check size={14} /> : <Copy size={14} />}
+            {copied ? t("Copied", "已复制") : t("Copy", "复制")}
+          </button>
+        </div>
+      </footer>
+    </div>
+  );
+}

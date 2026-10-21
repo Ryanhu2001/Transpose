@@ -1,0 +1,2 @@
+"NSScreenCaptureUsageDescription" = "识别你圈选区域中的文字。截图仅在本机识别，不上传截图。";
+"NSAccessibilityUsageDescription" = "读取你在其他应用中选中的文字，并在选区旁显示小翻译按钮。";
