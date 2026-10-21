@@ -1,0 +1,21 @@
+[package]
+name = "transpose"
+version = "0.6.0"
+description = "A small translation companion for macOS"
+authors = ["Ryan"]
+license = "MIT"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["macos-private-api"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync", "time"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"

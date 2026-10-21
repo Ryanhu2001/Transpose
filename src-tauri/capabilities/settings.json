@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "settings",
+  "description": "Only the local settings webview can call Transpose's native bridge.",
+  "windows": ["settings"],
+  "permissions": ["core:default"]
+}
