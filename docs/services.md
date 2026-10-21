@@ -1,6 +1,6 @@
 # Translation services and glossary
 
-Choose **Services / 翻译服务** in Settings: Apple, DeepSeek, OpenRouter, Custom API or Local CLI.
+Choose **Services / 翻译服务** in Settings: Apple (Mac only), DeepSeek, OpenRouter, Custom API or Local CLI.
 
 ## Services
 
@@ -14,7 +14,7 @@ Choose **Services / 翻译服务** in Settings: Apple, DeepSeek, OpenRouter, Cus
 
 Apple Translation runs locally once its language pair is ready. Apple manages language downloads separately from the app. Very short or mixed-language text may be detected incorrectly.
 
-API keys are scoped to the provider and endpoint in macOS Keychain. Test a connection after changing it. A successful test does not guarantee future quota or model availability.
+API keys are scoped to the provider and endpoint in macOS Keychain or Windows Credential Manager. Test a connection after changing it. A successful test does not guarantee future quota or model availability.
 
 OpenRouter provides [registration](https://openrouter.ai/) and [API keys](https://openrouter.ai/settings/keys). Free routes have limits; choosing another model may cost money. Transpose does not buy credits or silently switch to a paid route.
 

@@ -52,7 +52,9 @@ jobs:
             ~/.cargo/git
             .build/windows-target
           key: windows-x64-${{ hashFiles('src-tauri/Cargo.lock') }}-${{ github.sha }}
-          restore-keys: windows-x64-${{ hashFiles('src-tauri/Cargo.lock') }}-
+          restore-keys: |
+            windows-x64-${{ hashFiles('src-tauri/Cargo.lock') }}-
+            windows-x64-
 
       - name: Verify frontend
         run: npm run typecheck && npm test && npm run build
@@ -61,7 +63,10 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc --locked
 
       - name: Build Windows installer
-        run: npm run tauri -- build --target x86_64-pc-windows-msvc --bundles nsis --ci
+        run: |
+          Remove-Item -LiteralPath "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/bundle" -Recurse -Force -ErrorAction SilentlyContinue
+          npm run tauri -- build --target x86_64-pc-windows-msvc --bundles nsis --ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Ensure WebView2 runtime
         run: |
@@ -94,8 +99,9 @@ jobs:
 
       - name: Install and smoke test the packaged app
         run: |
-          $installer = Get-ChildItem "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe" | Select-Object -First 1
-          if (-not $installer) { throw "The NSIS installer was not generated." }
+          $installers = @(Get-ChildItem "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe")
+          if ($installers.Count -ne 1) { throw 'Expected exactly one Windows installer.' }
+          $installer = $installers[0]
           $installDirectory = Join-Path $env:GITHUB_WORKSPACE ".build/windows-installed"
           $installation = Start-Process -FilePath $installer.FullName -ArgumentList @("/S", "/D=$installDirectory") -Wait -PassThru
           if ($installation.ExitCode -ne 0) { throw "Installer exited with code $($installation.ExitCode)." }
@@ -108,10 +114,20 @@ jobs:
           $version = (Get-Content VERSION -Raw).Trim()
           $artifacts = Join-Path $env:GITHUB_WORKSPACE ".build/windows-artifacts"
           New-Item -Path $artifacts -ItemType Directory -Force | Out-Null
-          $installer = Get-ChildItem "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe" | Select-Object -First 1
+          $installers = @(Get-ChildItem "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe")
+          if ($installers.Count -ne 1) { throw 'Expected exactly one Windows installer.' }
+          $installer = $installers[0]
+          $productVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($installer.FullName).ProductVersion
+          if ($productVersion -notin @($version, "$version.0")) { throw 'Installer product version differs from VERSION.' }
           $name = "Transpose-$version-Windows-x64-setup.exe"
           Copy-Item -LiteralPath $installer.FullName -Destination (Join-Path $artifacts $name)
           $hash = (Get-FileHash (Join-Path $artifacts $name) -Algorithm SHA256).Hash.ToLowerInvariant()
+          [System.IO.File]::WriteAllText((Join-Path $artifacts 'windows.json'), (@{
+            version = $version
+            productVersion = $productVersion
+            architecture = 'x64'
+            sha256 = $hash
+          } | ConvertTo-Json))
           [System.IO.File]::WriteAllText((Join-Path $artifacts "SHA256SUMS.txt"), "$hash  $name`n")
           [System.IO.File]::WriteAllText((Join-Path $artifacts "build.json"), (@{
             version = $version
