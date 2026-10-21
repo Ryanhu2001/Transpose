@@ -1,8 +1,9 @@
 use reqwest::{redirect::Policy, Client, Url};
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::{sync::OnceLock, time::Duration};
 
 const MAXIMUM_BYTES: usize = 2_000_000;
+static CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
 
 /// Reject clear-text remote endpoints and URL credentials before resolving any
 /// API key. Authorization never follows a redirect to a different service.
@@ -78,12 +79,19 @@ pub async fn translate(
         body["reasoning"] = json!({"enabled":false});
         body["provider"] = json!({"allow_fallbacks":false});
     }
-    let client = Client::builder()
-        .redirect(Policy::none())
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(60))
-        .build()
-        .map_err(|_| "Unable to start the translation connection.")?;
+    // Share the connection pool across translations while keeping credentials
+    // on each individual request, so repeat lookups reuse TLS connections.
+    let client = CLIENT
+        .get_or_init(|| {
+            Client::builder()
+                .redirect(Policy::none())
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(60))
+                .build()
+                .map_err(|_| "Unable to start the translation connection.".to_owned())
+        })
+        .as_ref()
+        .map_err(Clone::clone)?;
     let mut request = client
         .post(url)
         .header("Accept", "text/event-stream")

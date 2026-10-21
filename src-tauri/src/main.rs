@@ -250,7 +250,8 @@ fn main() {
             #[cfg(target_os = "macos")]
             let login = unsafe { transpose_native_is_login_launch() };
             #[cfg(target_os = "windows")]
-            let login = std::env::args().any(|arg| matches!(arg.as_str(), "--login" | "--background"));
+            let login =
+                std::env::args().any(|arg| matches!(arg.as_str(), "--login" | "--background"));
             if !std::env::args().any(|arg| arg == "--capture-permission-probe")
                 && (!login || std::env::args().any(|arg| arg == "--settings"))
             {

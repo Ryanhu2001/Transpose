@@ -91,7 +91,10 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_credential_manager_roundtrips_an_isolated_test_entry() {
-        let endpoint = format!("http://localhost:18080/transpose-test-{}", uuid::Uuid::new_v4());
+        let endpoint = format!(
+            "http://localhost:18080/transpose-test-{}",
+            uuid::Uuid::new_v4()
+        );
         let key = format!("transpose-fixture-{}", uuid::Uuid::new_v4());
         save("customAPI", &endpoint, &key).unwrap();
         let saved = read("customAPI", &endpoint).unwrap();

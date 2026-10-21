@@ -335,6 +335,11 @@ unsafe extern "system" {
 unsafe extern "system" {
     fn DwmFlush() -> i32;
 }
+#[link(name = "runtimeobject")]
+unsafe extern "system" {
+    fn RoInitialize(initialization: u32) -> i32;
+    fn RoUninitialize();
+}
 #[link(name = "advapi32")]
 unsafe extern "system" {
     fn RegCreateKeyExW(
@@ -448,11 +453,11 @@ pub fn stop() {
 }
 pub fn ocr_languages() -> Vec<String> {
     thread::spawn(|| unsafe {
-        let initialized = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
-        let result = ocr::available_languages().unwrap_or_default();
-        if initialized {
-            CoUninitialize();
+        if RoInitialize(1) < 0 {
+            return Vec::new();
         }
+        let result = ocr::available_languages().unwrap_or_default();
+        RoUninitialize();
         result
     })
     .join()
@@ -463,9 +468,13 @@ pub fn ocr_languages() -> Vec<String> {
 /// this on a worker thread; no screenshot or recognized content is persisted.
 pub fn run_self_test() -> Result<serde_json::Value, String> {
     unsafe {
-        CoInitializeEx(None, COINIT_MULTITHREADED)
-            .ok()
-            .map_err(|e| e.to_string())?;
+        let initialization = RoInitialize(1);
+        if initialization < 0 {
+            return Err(format!(
+                "Windows Runtime initialization failed: 0x{:08x}",
+                initialization as u32
+            ));
+        }
         let result = (|| {
             let image = desktop_image()?;
             let capture = serde_json::json!({"width":image.width,"height":image.height,"bytes":image.pixels.len()});
@@ -505,7 +514,7 @@ pub fn run_self_test() -> Result<serde_json::Value, String> {
                 serde_json::json!({"screenCapture":capture,"ocrLanguages":languages,"ocr":true,"freeformFilter":true,"selection":true,"networkRequests":0}),
             )
         })();
-        CoUninitialize();
+        RoUninitialize();
         result
     }
 }
@@ -711,17 +720,24 @@ unsafe extern "system" fn controller_proc(
             return 0;
         }
         CLEAR_OUTLINE => {
-            STATE.with(|cell| {
-                if let Some(state) = cell.borrow_mut().as_mut() {
-                    ShowWindow(state.launcher, 0);
+            if wparam == 0 {
+                CAPTURE_ACTIVE.store(false, Ordering::Release);
+            }
+            let handles = STATE.with(|cell| {
+                cell.borrow_mut().as_mut().map(|state| {
                     state.selection = None;
                     if wparam == 0 {
-                        ShowWindow(state.overlay, 0);
                         state.capture = None;
-                        CAPTURE_ACTIVE.store(false, Ordering::Release);
                     }
-                }
+                    (state.launcher, state.overlay)
+                })
             });
+            if let Some((launcher, overlay)) = handles {
+                ShowWindow(launcher, 0);
+                if wparam == 0 {
+                    ShowWindow(overlay, 0);
+                }
+            }
             return 0;
         }
         STOP => {
@@ -1020,37 +1036,48 @@ unsafe fn read_selection(
 
 unsafe fn begin_capture() {
     GENERATION.fetch_add(1, Ordering::AcqRel);
+    // ShowWindow may synchronously dispatch WM_ACTIVATE. Mark the old overlay
+    // inactive and release STATE before calling any window activation APIs.
+    CAPTURE_ACTIVE.store(false, Ordering::Release);
     let callbacks = STATE.with(|cell| cell.borrow().as_ref().map(|state| state.callbacks.clone()));
     let Some(callbacks) = callbacks else {
         return;
     };
-    STATE.with(|cell| {
-        if let Some(state) = cell.borrow_mut().as_mut() {
-            ShowWindow(state.launcher, 0);
-            ShowWindow(state.overlay, 0);
+    let handles = STATE.with(|cell| {
+        cell.borrow_mut().as_mut().map(|state| {
             state.capture = None;
-        }
+            (state.launcher, state.overlay)
+        })
     });
+    if let Some((launcher, overlay)) = handles {
+        ShowWindow(launcher, 0);
+        ShowWindow(overlay, 0);
+    }
     // Let DWM present the hidden launcher/old outline before sampling pixels.
     DwmFlush();
     match desktop_image() {
-        Ok(image) => STATE.with(|cell| {
-            if let Some(state) = cell.borrow_mut().as_mut() {
-                let frame = (image.left, image.top, image.width, image.height);
-                state.capture = Some(Capture {
-                    image,
-                    points: Vec::new(),
-                    drawing: false,
-                    rectangle: false,
-                    finished: false,
-                });
-                SetWindowLongPtrW(state.overlay, -20, (EX_TOOLWINDOW | EX_TOPMOST) as isize);
+        Ok(image) => {
+            let prepared = STATE.with(|cell| {
+                cell.borrow_mut().as_mut().map(|state| {
+                    let frame = (image.left, image.top, image.width, image.height);
+                    state.capture = Some(Capture {
+                        image,
+                        points: Vec::new(),
+                        drawing: false,
+                        rectangle: false,
+                        finished: false,
+                    });
+                    (state.overlay, frame)
+                })
+            });
+            if let Some((overlay, frame)) = prepared {
+                SetWindowLongPtrW(overlay, -20, (EX_TOOLWINDOW | EX_TOPMOST) as isize);
                 CAPTURE_ACTIVE.store(true, Ordering::Release);
-                SetWindowPos(state.overlay, -1, frame.0, frame.1, frame.2, frame.3, 0x40);
-                SetForegroundWindow(state.overlay);
-                InvalidateRect(state.overlay, null(), 0);
+                SetWindowPos(overlay, -1, frame.0, frame.1, frame.2, frame.3, 0x40);
+                SetForegroundWindow(overlay);
+                InvalidateRect(overlay, null(), 0);
             }
-        }),
+        }
         Err(error) => (callbacks.on_error)(error),
     }
 }
@@ -1223,12 +1250,15 @@ unsafe extern "system" fn capture_proc(
 }
 unsafe fn cancel_capture() {
     CAPTURE_ACTIVE.store(false, Ordering::Release);
-    STATE.with(|cell| {
-        if let Some(state) = cell.borrow_mut().as_mut() {
-            ShowWindow(state.overlay, 0);
+    let overlay = STATE.with(|cell| {
+        cell.borrow_mut().as_mut().map(|state| {
             state.capture = None;
-        }
+            state.overlay
+        })
     });
+    if let Some(overlay) = overlay {
+        ShowWindow(overlay, 0);
+    }
 }
 fn polygon_points(capture: &Capture) -> Vec<Point> {
     if capture.rectangle && capture.points.len() >= 2 {
@@ -1256,6 +1286,7 @@ fn polygon_points(capture: &Capture) -> Vec<Point> {
     }
 }
 unsafe fn finish_capture(point: Point) {
+    let mut cancelled = false;
     let work = STATE.with(|cell| {
         let mut state = cell.borrow_mut();
         let state = state.as_mut()?;
@@ -1290,9 +1321,7 @@ unsafe fn finish_capture(point: Point) {
         let width = right - left;
         let height = bottom - top;
         if polygon.len() < 4 || width < 8 || height < 8 {
-            ShowWindow(state.overlay, 0);
-            state.capture = None;
-            CAPTURE_ACTIVE.store(false, Ordering::Release);
+            cancelled = true;
             return None;
         }
         let mut pixels = vec![255; width as usize * height as usize * 4];
@@ -1314,13 +1343,6 @@ unsafe fn finish_capture(point: Point) {
         capture.image.pixels.shrink_to_fit();
         DeleteObject(capture.image.bitmap);
         capture.image.bitmap = 0;
-        SetWindowLongPtrW(
-            state.overlay,
-            -20,
-            (EX_TOOLWINDOW | EX_TOPMOST | EX_NOACTIVATE | EX_LAYERED | EX_TRANSPARENT) as isize,
-        );
-        SetLayeredWindowAttributes(state.overlay, WHITE, 255, 1);
-        InvalidateRect(state.overlay, null(), 1);
         CAPTURE_ACTIVE.store(false, Ordering::Release);
         Some((
             state.callbacks.clone(),
@@ -1330,20 +1352,39 @@ unsafe fn finish_capture(point: Point) {
             local_polygon,
             anchor,
             GENERATION.load(Ordering::Acquire),
+            state.overlay,
         ))
     });
-    let Some((callbacks, width, height, pixels, polygon, anchor, generation)) = work else {
+    if cancelled {
+        cancel_capture();
+    }
+    let Some((callbacks, width, height, pixels, polygon, anchor, generation, overlay)) = work
+    else {
         return;
     };
+    SetWindowLongPtrW(
+        overlay,
+        -20,
+        (EX_TOOLWINDOW | EX_TOPMOST | EX_NOACTIVATE | EX_LAYERED | EX_TRANSPARENT) as isize,
+    );
+    SetLayeredWindowAttributes(overlay, WHITE, 255, 1);
+    InvalidateRect(overlay, null(), 1);
     (callbacks.on_recognizing)(anchor);
     thread::Builder::new()
         .name("transpose-ocr".into())
         .spawn(move || {
-            let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).is_ok() };
-            let result = ocr::recognize(width, height, pixels, polygon);
-            if initialized {
+            let initialization = unsafe { RoInitialize(1) };
+            let result = if initialization >= 0 {
+                ocr::recognize(width, height, pixels, polygon)
+            } else {
+                Err(format!(
+                    "Windows OCR initialization failed: 0x{:08x}",
+                    initialization as u32
+                ))
+            };
+            if initialization >= 0 {
                 unsafe {
-                    CoUninitialize();
+                    RoUninitialize();
                 }
             }
             if generation != GENERATION.load(Ordering::Acquire) {
