@@ -43,6 +43,17 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Restore Rust build cache
+        id: rust-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            .build/windows-target
+          key: windows-x64-${{ hashFiles('src-tauri/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: windows-x64-${{ hashFiles('src-tauri/Cargo.lock') }}-
+
       - name: Verify frontend
         run: npm run typecheck && npm test && npm run build
 
@@ -140,3 +151,13 @@ jobs:
           path: .build/windows-smoke/
           if-no-files-found: ignore
           retention-days: 14
+
+      - name: Save Rust build cache
+        if: always() && !cancelled() && steps.rust-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            .build/windows-target
+          key: windows-x64-${{ hashFiles('src-tauri/Cargo.lock') }}-${{ github.sha }}

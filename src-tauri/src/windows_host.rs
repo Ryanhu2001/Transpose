@@ -77,7 +77,12 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
         }),
-        on_error: Arc::new(move |error| error_state.show_error(error)),
+        on_error: Arc::new(move |error| {
+            let state = error_state.clone();
+            tauri::async_runtime::spawn(async move {
+                state.show_error(error);
+            });
+        }),
         on_recognizing: Arc::new(move |point| {
             set_anchor(point);
             recognize_state.show_recognizing();
