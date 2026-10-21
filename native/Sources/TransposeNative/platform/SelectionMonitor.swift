@@ -296,7 +296,7 @@ final class SelectionMonitor {
                   await reader.allowsChatKeyboardCopy(pid: pid, context: chatContext),
                   !cancellation.isCancelled, isCurrent(pid: pid, request: request, requireEnabled: requireEnabled),
                   !attempt.userRequestedCopy, pasteboard.changeCount == snapshot.changeCount,
-                  postCopyKey() else { return nil }
+                  await postCopyKey(to: pid, request: request, requireEnabled: requireEnabled, cancellation: cancellation) else { return nil }
         case .invoked:
             // Copy has already been sent. Even a cancelled originating task
             // must observe its bounded clipboard cleanup below.
@@ -307,7 +307,7 @@ final class SelectionMonitor {
             }
             guard !cancellation.isCancelled, isCurrent(pid: pid, request: request, requireEnabled: requireEnabled),
                   !attempt.userRequestedCopy, pasteboard.changeCount == snapshot.changeCount else { return nil }
-            guard postCopyKey() else { return nil }
+            guard await postCopyKey(to: pid, request: request, requireEnabled: requireEnabled, cancellation: cancellation) else { return nil }
         }
 
         // A cancelled task still gets bounded cleanup for its own text copy.
@@ -338,16 +338,31 @@ final class SelectionMonitor {
         return nil
     }
 
-    private func postCopyKey() -> Bool {
-        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 8, keyDown: true),
-              let up = CGEvent(keyboardEventSource: nil, virtualKey: 8, keyDown: false) else { return false }
+    private func postCopyKey(to pid: pid_t, request: Int, requireEnabled: Bool,
+                             cancellation: SelectionCancellation) async -> Bool {
+        guard let source = CGEventSource(stateID: .hidSystemState),
+              let down = CGEvent(keyboardEventSource: source, virtualKey: 8, keyDown: true),
+              let up = CGEvent(keyboardEventSource: source, virtualKey: 8, keyDown: false) else { return false }
         for event in [down, up] {
             event.flags = .maskCommand
             event.setIntegerValueField(.eventSourceUserData, value: Self.copyEventTag)
-            event.post(tap: .cghidEventTap)
         }
-        return true
+        // A nonactivating overlay may be key while the source app remains
+        // frontmost. Route Copy to that source PID, rather than the HID stream.
+        let sent = await SelectionPolicy.sendCopyKey(to: pid, allowed: { [self] in
+            !cancellation.isCancelled && isCurrent(pid: pid, request: request, requireEnabled: requireEnabled)
+        }, keyDown: { destination in
+            down.postToPid(destination)
+            return true
+        }, keyUp: { destination in
+            up.postToPid(destination)
+        }, pause: {
+            try? await Task.sleep(for: .milliseconds(30))
+        })
+        if sent { diagnose("copy", reason: "key_sent_to_source", bundle: sourceApplication()?.bundleIdentifier) }
+        return sent
     }
+
 }
 
 @MainActor

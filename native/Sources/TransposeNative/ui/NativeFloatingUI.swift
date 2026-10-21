@@ -11,7 +11,7 @@ private final class FirstMouseHostingView<Content: View>: NSHostingView<Content>
 final class NativeResultPanel: NSPanel {
     var onEscape: (() -> Void)?
     var focusesOnClick = false
-    override var canBecomeKey: Bool { true }
+    override var canBecomeKey: Bool { focusesOnClick }
     override var canBecomeMain: Bool { false }
     override func cancelOperation(_ sender: Any?) { onEscape?() }
     override func sendEvent(_ event: NSEvent) {
@@ -159,6 +159,7 @@ final class NativeFloatingUI: NSObject, NSWindowDelegate, WKNavigationDelegate, 
     func showButton(at point: NSPoint, action: @escaping () -> Void) {
         hideButton()
         let panel = makePanel(size: NSSize(width: 40, height: 38))
+        panel.becomesKeyOnlyIfNeeded = true
         panel.title = L10n.text("翻译选区")
         panel.contentView = FirstMouseHostingView(rootView: NativeTranslateButton(action: action,
             onHoverChanged: { [weak self] inside in

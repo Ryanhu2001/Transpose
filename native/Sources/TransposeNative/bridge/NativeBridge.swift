@@ -439,22 +439,13 @@ final class NativeBridge: NSObject {
             guard let self, self.settings.automaticSelection, !self.capture.isActive else { return }
             self.dismiss()
             let request = self.generation
-            var state = NativeResultState()
-            state.id = request
-            state.sourceApp = candidate.sourceApp
-            state.isLoading = true
-            state.loadingMessage = "正在读取选中文字…"
-            state.isPinned = self.resultState?.isPinned ?? false
-            state.provider = self.settings.provider.title
-            state.status = self.settings.provider.title
-            self.resultState = state
-            self.floating.showResult(state: state.dictionary, near: candidate.anchor)
-            self.publishResult()
+            // Keep keyboard focus in the source app until an explicit Copy
+            // has completed. A loading panel must not become its key recipient.
             self.selectionReadTask = Task { [weak self] in
                 guard let self else { return }
                 let content = await self.selection.resolve(candidate)
                 guard !Task.isCancelled, self.generation == request, !self.capture.isActive else { return }
-                if let content { self.translate(content, preservingResult: true) }
+                if let content { self.translate(content) }
                 else { self.showError("没有读到选中文字。可以按 ⌥S 圈选屏幕中的内容。") }
             }
         }

@@ -28,6 +28,7 @@ struct NativeVerification {
             checks += try runBridgeChecks()
             checks += try runPermissionRecoveryChecks()
             checks += try runSelectionChecks()
+            checks += try await runSelectionDispatchChecks()
             let data = try JSONSerialization.data(withJSONObject: ["passed": checks, "elapsed": Date().timeIntervalSince(start), "networkRequests": 0], options: [.sortedKeys])
             print(String(data: data, encoding: .utf8)!)
         } catch {

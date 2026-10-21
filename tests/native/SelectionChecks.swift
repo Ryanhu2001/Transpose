@@ -282,3 +282,81 @@ func runSelectionChecks() throws -> Int {
 
     return checks
 }
+
+/// Mock dispatch callbacks only: never construct or post a CGEvent.
+@MainActor
+func runSelectionDispatchChecks() async throws -> Int {
+    struct Failure: LocalizedError {
+        let reason: String
+        var errorDescription: String? { "Selection dispatch: " + reason }
+    }
+    func require(_ value: @autoclosure () -> Bool, _ reason: String) throws -> Int {
+        guard value() else { throw Failure(reason: reason) }
+        return 1
+    }
+    var checks = 0
+    var trace = [String]()
+    let sent = await SelectionPolicy.sendCopyKey(to: 42, allowed: { true },
+                                                keyDown: { trace.append("down:\($0)"); return true },
+                                                keyUp: { trace.append("up:\($0)") },
+                                                pause: { trace.append("pause"); await Task.yield() })
+    checks += try require(sent, "An allowed dispatch reports successful key delivery")
+    checks += try require(trace == ["down:42", "pause", "up:42"], "Copy sends one ordered key pair to the original PID")
+
+    for pid: Int32 in [0, -1] {
+        trace = []
+        let sent = await SelectionPolicy.sendCopyKey(to: pid, allowed: { true },
+                                                    keyDown: { trace.append("down:\($0)"); return true },
+                                                    keyUp: { trace.append("up:\($0)") },
+                                                    pause: { trace.append("pause") })
+        checks += try require(!sent && trace.isEmpty, "Invalid process \(pid) receives no key, pause or key-up")
+    }
+
+    trace = []
+    let rejected = await SelectionPolicy.sendCopyKey(to: 42, allowed: { false },
+                                                    keyDown: { trace.append("down:\($0)"); return true },
+                                                    keyUp: { trace.append("up:\($0)") },
+                                                    pause: { trace.append("pause") })
+    checks += try require(!rejected && trace.isEmpty, "A stale or cancelled request cannot begin key dispatch")
+
+    trace = []
+    let failed = await SelectionPolicy.sendCopyKey(to: 42, allowed: { true },
+                                                  keyDown: { trace.append("down:\($0)"); return false },
+                                                  keyUp: { trace.append("up:\($0)") },
+                                                  pause: { trace.append("pause") })
+    checks += try require(!failed && trace == ["down:42"], "A failed key-down is not retried and receives no pause or unmatched key-up")
+
+    trace = []
+    let token = SelectionCancellation()
+    _ = await SelectionPolicy.sendCopyKey(to: 42, allowed: { !token.isCancelled },
+                                         keyDown: { trace.append("down:\($0)"); return true },
+                                         keyUp: { trace.append("up:\($0)") },
+                                         pause: { trace.append("pause"); token.cancel(); await Task.yield() })
+    checks += try require(token.isCancelled && trace == ["down:42", "pause", "up:42"],
+                          "Origin cancellation during the pause still releases the original process's key")
+
+    trace = []
+    var foregroundPID: Int32 = 42
+    _ = await SelectionPolicy.sendCopyKey(to: 42, allowed: { foregroundPID == 42 },
+                                         keyDown: { trace.append("down:\($0)"); return true },
+                                         keyUp: { trace.append("up:\($0)") },
+                                         pause: { trace.append("pause"); foregroundPID = 77; await Task.yield() })
+    checks += try require(foregroundPID == 77 && trace == ["down:42", "pause", "up:42"],
+                          "Focus changes never route key-up into the newly active application")
+
+    trace = []
+    let cancelledDispatch = Task { @MainActor in
+        await SelectionPolicy.sendCopyKey(to: 42, allowed: { !Task.isCancelled },
+                                          keyDown: { trace.append("down:\($0)"); return true },
+                                          keyUp: { trace.append("up:\($0)") },
+                                          pause: {
+                                              trace.append("pause")
+                                              withUnsafeCurrentTask { $0?.cancel() }
+                                              await Task.yield()
+                                          })
+    }
+    _ = await cancelledDispatch.value
+    checks += try require(cancelledDispatch.isCancelled && trace == ["down:42", "pause", "up:42"],
+                          "Actual Task cancellation cannot leave the source application's copy key held down")
+    return checks
+}

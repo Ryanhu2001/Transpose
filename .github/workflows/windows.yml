@@ -147,7 +147,7 @@ jobs:
             -ExecutablePath "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/transpose.exe" `
             -Mode Platform `
             -OutputDirectory ".build/windows-smoke/platform" `
-            -TimeoutSeconds 60
+            -TimeoutSeconds 90
 
       - name: Upload smoke test reports
         if: always()

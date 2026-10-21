@@ -106,6 +106,18 @@ enum SelectionPolicy {
     static func menuFallbackResult(searchCompleted: Bool) -> CopyMenuResult {
         searchCompleted ? .unavailable : .disabled
     }
+    /// The destination is captured before key-down. Always release the same
+    /// application's key after a suspension, even if that request is cancelled.
+    @MainActor
+    static func sendCopyKey(to pid: Int32, allowed: () -> Bool,
+                            keyDown: (Int32) -> Bool, keyUp: (Int32) -> Void,
+                            pause: () async -> Void) async -> Bool {
+        guard pid > 0, allowed(), keyDown(pid) else { return false }
+        await pause()
+        keyUp(pid)
+        return true
+    }
+
     enum ClipboardDecision: Equatable { case wait, abandon, acceptAndRestore(String) }
 
     static func clipboardDecision(originalCount: Int, observedCount: Int, text: String?,

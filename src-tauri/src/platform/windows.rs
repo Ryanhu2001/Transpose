@@ -657,7 +657,9 @@ unsafe fn diagnostic_selection() -> Result<String, String> {
 $ErrorActionPreference = 'Stop'
 trap { [Console]::Error.WriteLine($_.Exception.Message); exit 2 }
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::Error.WriteLine('wpf:start')
 Add-Type -AssemblyName PresentationFramework
+[Console]::Error.WriteLine('wpf:framework-loaded')
 $window = [System.Windows.Window]::new()
 $window.Title = 'Transpose selection fixture'
 $window.Width = 440
@@ -671,19 +673,23 @@ $text.AcceptsReturn = $true
 $text.FontSize = 20
 $text.Margin = [System.Windows.Thickness]::new(12)
 $window.Content = $text
-$window.Add_ContentRendered({
+$window.Add_Loaded({
+    [Console]::Error.WriteLine('wpf:loaded')
     $window.Activate() | Out-Null
     $text.Focus() | Out-Null
     $text.Select(0,9)
     $peer = [System.Windows.Automation.Peers.UIElementAutomationPeer]::CreatePeerForElement($text)
     [Console]::Out.WriteLine(([System.Windows.Interop.WindowInteropHelper]::new($window)).Handle.ToInt64())
     [Console]::Out.Flush()
+    [Console]::Error.WriteLine('wpf:ready')
+    $timer.Start()
 })
 $timer = [System.Windows.Threading.DispatcherTimer]::new()
-$timer.Interval = [TimeSpan]::FromSeconds(10)
-$timer.Add_Tick({ $window.Close() })
-$timer.Start()
+$timer.Interval = [TimeSpan]::FromSeconds(20)
+$timer.Add_Tick({ $timer.Stop(); $window.Close() })
+[Console]::Error.WriteLine('wpf:showing')
 $window.ShowDialog() | Out-Null
+[Console]::Error.WriteLine('wpf:closed')
 "#;
     let powershell = std::env::var_os("SystemRoot")
         .map(std::path::PathBuf::from)
@@ -717,12 +723,20 @@ $window.ShowDialog() | Out-Null
             .map(|_| line.trim().parse::<Handle>().unwrap_or(0));
         let _ = ready_tx.send(result);
     });
-    let hwnd = ready_rx
-        .recv_timeout(Duration::from_secs(10))
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or(0);
+    let (hwnd, startup) = match ready_rx.recv_timeout(Duration::from_secs(25)) {
+        Ok(Ok(hwnd)) if hwnd != 0 => (hwnd, "ready".to_owned()),
+        Ok(Ok(_)) => (
+            0,
+            "stdout ended or returned an invalid window handle".to_owned(),
+        ),
+        Ok(Err(error)) => (0, format!("stdout read failed: {error}")),
+        Err(error) => (0, format!("25-second startup deadline: {error}")),
+    };
     let result = if hwnd == 0 {
+        let process = fixture
+            .try_wait()
+            .map(|status| format!("{status:?}"))
+            .unwrap_or_else(|error| format!("status error: {error}"));
         let _ = fixture.kill();
         let _ = fixture.wait();
         let mut error = String::new();
@@ -730,8 +744,8 @@ $window.ShowDialog() | Out-Null
             let _ = stderr.read_to_string(&mut error);
         }
         Err(format!(
-            "The WPF selection fixture did not expose a window: {}",
-            error.trim()
+            "The WPF selection fixture did not expose a window (startup={startup}; process-before-cleanup={process}; stderr={}): {}",
+            if error.trim().is_empty() {"empty"} else {"available"},error.trim()
         ))
     } else {
         (|| -> Result<String, String> {
@@ -816,7 +830,9 @@ unsafe fn diagnostic_legacy_selection() -> Result<serde_json::Value, String> {
 $ErrorActionPreference = 'Stop'
 trap { [Console]::Error.WriteLine($_.Exception.Message); exit 2 }
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::Error.WriteLine('legacy:start')
 Add-Type -AssemblyName System.Windows.Forms
+[Console]::Error.WriteLine('legacy:framework-loaded')
 $form = [System.Windows.Forms.Form]::new()
 $form.Text = 'Transpose legacy selection fixture'
 $form.Width = 460
@@ -839,18 +855,22 @@ $password.UseSystemPasswordChar = $true
 $password.Text = 'Transpose private fixture'
 $form.Controls.AddRange(@($edit,$rich,$password))
 $form.Add_Shown({
+    [Console]::Error.WriteLine('legacy:shown')
     $edit.Select($edit.Text.IndexOf('Transpose'),9)
     $rich.Select($rich.Text.IndexOf('Transpose'),9)
     $password.Select(0,9)
     $edit.Focus() | Out-Null
     [Console]::Out.WriteLine(('{0},{1},{2},{3}' -f $form.Handle.ToInt64(),$edit.Handle.ToInt64(),$rich.Handle.ToInt64(),$password.Handle.ToInt64()))
     [Console]::Out.Flush()
+    [Console]::Error.WriteLine('legacy:ready')
+    $timer.Start()
 })
 $timer = [System.Windows.Forms.Timer]::new()
-$timer.Interval = 10000
-$timer.Add_Tick({ $form.Close() })
-$timer.Start()
+$timer.Interval = 20000
+$timer.Add_Tick({ $timer.Stop(); $form.Close() })
+[Console]::Error.WriteLine('legacy:showing')
 $form.ShowDialog() | Out-Null
+[Console]::Error.WriteLine('legacy:closed')
 "#;
     let powershell = std::env::var_os("SystemRoot")
         .map(std::path::PathBuf::from)
@@ -887,12 +907,22 @@ $form.ShowDialog() | Out-Null
         });
         let _ = ready_tx.send(result);
     });
-    let handles = ready_rx
-        .recv_timeout(Duration::from_secs(10))
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or_default();
-    let result = if handles.len() != 4 {
+    let (handles, startup) = match ready_rx.recv_timeout(Duration::from_secs(25)) {
+        Ok(Ok(handles)) if handles.len() == 4 && handles.iter().all(|handle| *handle != 0) => {
+            (handles, "ready".to_owned())
+        }
+        Ok(Ok(handles)) => (
+            handles,
+            "stdout ended or returned invalid control handles".to_owned(),
+        ),
+        Ok(Err(error)) => (Vec::new(), format!("stdout read failed: {error}")),
+        Err(error) => (Vec::new(), format!("25-second startup deadline: {error}")),
+    };
+    let result = if handles.len() != 4 || handles.iter().any(|handle| *handle == 0) {
+        let process = fixture
+            .try_wait()
+            .map(|status| format!("{status:?}"))
+            .unwrap_or_else(|error| format!("status error: {error}"));
         let _ = fixture.kill();
         let _ = fixture.wait();
         let mut error = String::new();
@@ -900,8 +930,8 @@ $form.ShowDialog() | Out-Null
             let _ = stderr.read_to_string(&mut error);
         }
         Err(format!(
-            "The legacy selection fixture did not expose its controls: {}",
-            error.trim()
+            "The legacy selection fixture did not expose its controls (startup={startup}; process-before-cleanup={process}; stderr={}): {}",
+            if error.trim().is_empty() {"empty"} else {"available"},error.trim()
         ))
     } else {
         (|| -> Result<serde_json::Value, String> {
