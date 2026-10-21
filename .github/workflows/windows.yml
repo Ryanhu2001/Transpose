@@ -86,26 +86,6 @@ jobs:
             -ExecutablePath "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/transpose.exe" `
             -OutputDirectory ".build/windows-smoke/built"
 
-      - name: Ensure English OCR capability
-        run: |
-          $capabilityName = "Language.OCR~~~en-US~0.0.1.0"
-          $capability = Get-WindowsCapability -Online -Name $capabilityName
-          if ($capability.State -ne "Installed") {
-            Add-WindowsCapability -Online -Name $capabilityName -ErrorAction Stop
-            $capability = Get-WindowsCapability -Online -Name $capabilityName
-            if ($capability.State -ne "Installed") {
-              throw "The runner does not have the English OCR capability."
-            }
-          }
-
-      - name: Test Windows screen capture, OCR and selection
-        run: |
-          ./scripts/test-windows-smoke.ps1 `
-            -ExecutablePath "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/transpose.exe" `
-            -Mode Platform `
-            -OutputDirectory ".build/windows-smoke/platform" `
-            -TimeoutSeconds 60
-
       - name: Install and smoke test the packaged app
         run: |
           $installer = Get-ChildItem "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe" | Select-Object -First 1
@@ -142,6 +122,26 @@ jobs:
           path: .build/windows-artifacts/
           if-no-files-found: error
           retention-days: 14
+
+      - name: Ensure English OCR capability
+        run: |
+          $capabilityName = "Language.OCR~~~en-US~0.0.1.0"
+          $capability = Get-WindowsCapability -Online -Name $capabilityName
+          if ($capability.State -ne "Installed") {
+            Add-WindowsCapability -Online -Name $capabilityName -ErrorAction Stop
+            $capability = Get-WindowsCapability -Online -Name $capabilityName
+            if ($capability.State -ne "Installed") {
+              throw "The runner does not have the English OCR capability."
+            }
+          }
+
+      - name: Test Windows screen capture, OCR and selection
+        run: |
+          ./scripts/test-windows-smoke.ps1 `
+            -ExecutablePath "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/transpose.exe" `
+            -Mode Platform `
+            -OutputDirectory ".build/windows-smoke/platform" `
+            -TimeoutSeconds 60
 
       - name: Upload smoke test reports
         if: always()

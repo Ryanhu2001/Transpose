@@ -226,6 +226,7 @@ unsafe extern "system" {
     fn SetWindowLongPtrW(hwnd: Handle, index: i32, value: isize) -> isize;
     fn SetLayeredWindowAttributes(hwnd: Handle, color: u32, alpha: u8, flags: u32) -> i32;
     fn SetForegroundWindow(hwnd: Handle) -> i32;
+    fn SetFocus(hwnd: Handle) -> Handle;
     fn GetForegroundWindow() -> Handle;
     fn GetWindowThreadProcessId(hwnd: Handle, pid: *mut u32) -> u32;
     fn GetWindowTextW(hwnd: Handle, text: *mut u16, capacity: i32) -> i32;
@@ -616,54 +617,128 @@ unsafe fn diagnostic_bitmap() -> Result<(u32, u32, Vec<u8>), String> {
 unsafe fn diagnostic_selection() -> Result<String, String> {
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let owner = thread::spawn(move || {
-        let window = CreateWindowExW(
+        // TextPattern is supplied by a multiline edit provider. A single-line
+        // EDIT advertises ValuePattern and does not exercise the selection API.
+        let instance = GetModuleHandleW(null());
+        let class_name = wide("TransposeSelectionFixture");
+        let class = WindowClass {
+            size: size_of::<WindowClass>() as u32,
+            style: 0,
+            procedure: Some(diagnostic_window_proc),
+            class_extra: 0,
+            window_extra: 0,
+            instance,
+            icon: 0,
+            cursor: LoadCursorW(0, 32512usize as *const u16),
+            background: 0,
+            menu: null(),
+            name: class_name.as_ptr(),
+            small_icon: 0,
+        };
+        RegisterClassExW(&class);
+        let parent = CreateWindowExW(
             EX_TOOLWINDOW,
-            wide("EDIT").as_ptr(),
+            class_name.as_ptr(),
             wide("Transpose selection fixture").as_ptr(),
-            WS_POPUP | 0x10000000 | 0x80,
+            0x00cf0000 | 0x10000000,
             30,
             30,
-            400,
-            80,
+            440,
+            180,
             0,
             0,
-            GetModuleHandleW(null()),
+            instance,
             null(),
         );
-        if window == 0 {
-            let _ = ready_tx.send(0);
+        if parent == 0 {
+            let _ = ready_tx.send((0, 0));
             return;
         }
-        SendMessageW(window, 0xb1, 0, 9); // EM_SETSEL: select exactly "Transpose".
-        let _ = ready_tx.send(window);
+        let edit = CreateWindowExW(
+            0,
+            wide("EDIT").as_ptr(),
+            wide("Transpose selection fixture\r\nNative multiline text").as_ptr(),
+            0x40000000 | 0x10000000 | 0x00800000 | 0x00010000 | 0x4 | 0x40 | 0x100,
+            12,
+            12,
+            400,
+            110,
+            parent,
+            1,
+            instance,
+            null(),
+        );
+        if edit == 0 {
+            DestroyWindow(parent);
+            let _ = ready_tx.send((0, 0));
+            return;
+        }
+        SetForegroundWindow(parent);
+        SetFocus(edit);
+        SendMessageW(edit, 0xb1, 0, 9); // EM_SETSEL: select exactly "Transpose".
+        let _ = ready_tx.send((parent, edit));
         let mut message: Message = zeroed();
         while GetMessageW(&mut message, 0, 0, 0) > 0 {
-            if message.message == 0x10 {
-                DestroyWindow(window);
-                break;
-            }
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
     });
-    let hwnd = ready_rx
+    let (parent, edit) = ready_rx
         .recv_timeout(Duration::from_secs(5))
         .map_err(|_| "Windows selection fixture did not start.")?;
-    if hwnd == 0 {
+    if edit == 0 {
         return Err("Windows selection fixture could not create a native text field.".into());
     }
-    let result = (|| -> windows::core::Result<String> {
+    let result = (|| -> Result<String, String> {
         let automation: IUIAutomation =
-            CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
-        let element = automation.ElementFromHandle(HWND(hwnd as *mut c_void))?;
-        let pattern = element.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)?;
-        let ranges = pattern.GetSelection()?;
-        let text = ranges.GetElement(0)?.GetText(100)?;
+            CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
+                .map_err(|error| format!("create UI Automation: {error}"))?;
+        let element = automation
+            .ElementFromHandle(HWND(edit as *mut c_void))
+            .map_err(|error| format!("find multiline EDIT: {error}"))?;
+        let pattern = element
+            .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+            .map_err(|error| format!("get TextPattern on multiline EDIT: {error}"))?;
+        let ranges = pattern
+            .GetSelection()
+            .map_err(|error| format!("read selected ranges: {error}"))?;
+        let count = ranges
+            .Length()
+            .map_err(|error| format!("count selected ranges: {error}"))?;
+        if count < 1 {
+            return Err("multiline EDIT returned no selected range".into());
+        }
+        let range = ranges
+            .GetElement(0)
+            .map_err(|error| format!("read first selected range: {error}"))?;
+        let text = range
+            .GetText(100)
+            .map_err(|error| format!("read selected text: {error}"))?;
         Ok(text.to_string())
     })();
-    PostMessageW(hwnd, 0x10, 0, 0);
+    PostMessageW(parent, 0x10, 0, 0);
     let _ = owner.join();
     result.map_err(|error| format!("Windows UI Automation selection fixture failed: {error}"))
+}
+
+unsafe extern "system" fn diagnostic_window_proc(
+    hwnd: Handle,
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+) -> isize {
+    match message {
+        0x10 => {
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        0x2 => {
+            PostQuitMessage(0);
+            return 0;
+        }
+        _ => {}
+    }
+    DefWindowProcW(hwnd, message, wparam, lparam)
 }
 
 unsafe extern "system" fn mouse_hook(code: i32, wparam: usize, lparam: isize) -> isize {
