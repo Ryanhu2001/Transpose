@@ -217,7 +217,6 @@ unsafe extern "system" {
     fn TranslateMessage(message: *const Message) -> i32;
     fn DispatchMessageW(message: *const Message) -> isize;
     fn PostMessageW(hwnd: Handle, message: u32, wparam: usize, lparam: isize) -> i32;
-    fn SendMessageW(hwnd: Handle, message: u32, wparam: usize, lparam: isize) -> isize;
     fn PostQuitMessage(code: i32);
     fn ShowWindow(hwnd: Handle, command: i32) -> i32;
     fn DestroyWindow(hwnd: Handle) -> i32;
@@ -226,7 +225,6 @@ unsafe extern "system" {
     fn SetWindowLongPtrW(hwnd: Handle, index: i32, value: isize) -> isize;
     fn SetLayeredWindowAttributes(hwnd: Handle, color: u32, alpha: u8, flags: u32) -> i32;
     fn SetForegroundWindow(hwnd: Handle) -> i32;
-    fn SetFocus(hwnd: Handle) -> Handle;
     fn GetForegroundWindow() -> Handle;
     fn GetWindowThreadProcessId(hwnd: Handle, pid: *mut u32) -> u32;
     fn GetWindowTextW(hwnd: Handle, text: *mut u16, capacity: i32) -> i32;
@@ -615,130 +613,166 @@ unsafe fn diagnostic_bitmap() -> Result<(u32, u32, Vec<u8>), String> {
 }
 
 unsafe fn diagnostic_selection() -> Result<String, String> {
+    use std::{
+        io::{BufRead, BufReader, Read},
+        os::windows::process::CommandExt,
+        process::{Command, Stdio},
+    };
+    // Windows Server stock EDIT controls can expose only the legacy proxy. WPF
+    // supplies its own TextBoxAutomationPeer and exercises the same native UIA
+    // TextPattern client path as Chromium, modern editors and other providers.
+    // This fixed, local fixture is used only by the explicit diagnostic flag.
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+trap { [Console]::Error.WriteLine($_.Exception.Message); exit 2 }
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+Add-Type -AssemblyName PresentationFramework
+$window = [System.Windows.Window]::new()
+$window.Title = 'Transpose selection fixture'
+$window.Width = 440
+$window.Height = 180
+$window.Left = 30
+$window.Top = 30
+$window.Topmost = $true
+$text = [System.Windows.Controls.TextBox]::new()
+$text.Text = "Transpose selection fixture`r`nNative UI Automation selection"
+$text.AcceptsReturn = $true
+$text.FontSize = 20
+$text.Margin = [System.Windows.Thickness]::new(12)
+$window.Content = $text
+$window.Add_ContentRendered({
+    $window.Activate() | Out-Null
+    $text.Focus() | Out-Null
+    $text.Select(0,9)
+    $peer = [System.Windows.Automation.Peers.UIElementAutomationPeer]::CreatePeerForElement($text)
+    [Console]::Out.WriteLine(([System.Windows.Interop.WindowInteropHelper]::new($window)).Handle.ToInt64())
+    [Console]::Out.Flush()
+})
+$timer = [System.Windows.Threading.DispatcherTimer]::new()
+$timer.Interval = [TimeSpan]::FromSeconds(10)
+$timer.Add_Tick({ $window.Close() })
+$timer.Start()
+$window.ShowDialog() | Out-Null
+"#;
+    let powershell = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| "C:\\Windows".into())
+        .join("System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+    let mut fixture = Command::new(powershell)
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-STA",
+            "-Command",
+            script,
+        ])
+        .creation_flags(0x08000000)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("Cannot start the local WPF selection fixture: {error}"))?;
+    let Some(stdout) = fixture.stdout.take() else {
+        let _ = fixture.kill();
+        let _ = fixture.wait();
+        return Err("The selection fixture has no output stream.".into());
+    };
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-    let owner = thread::spawn(move || {
-        // TextPattern is supplied by a multiline edit provider. A single-line
-        // EDIT advertises ValuePattern and does not exercise the selection API.
-        let instance = GetModuleHandleW(null());
-        let class_name = wide("TransposeSelectionFixture");
-        let class = WindowClass {
-            size: size_of::<WindowClass>() as u32,
-            style: 0,
-            procedure: Some(diagnostic_window_proc),
-            class_extra: 0,
-            window_extra: 0,
-            instance,
-            icon: 0,
-            cursor: LoadCursorW(0, 32512usize as *const u16),
-            background: 0,
-            menu: null(),
-            name: class_name.as_ptr(),
-            small_icon: 0,
-        };
-        RegisterClassExW(&class);
-        let parent = CreateWindowExW(
-            EX_TOOLWINDOW,
-            class_name.as_ptr(),
-            wide("Transpose selection fixture").as_ptr(),
-            0x00cf0000 | 0x10000000,
-            30,
-            30,
-            440,
-            180,
-            0,
-            0,
-            instance,
-            null(),
-        );
-        if parent == 0 {
-            let _ = ready_tx.send((0, 0));
-            return;
-        }
-        let edit = CreateWindowExW(
-            0,
-            wide("EDIT").as_ptr(),
-            wide("Transpose selection fixture\r\nNative multiline text").as_ptr(),
-            0x40000000 | 0x10000000 | 0x00800000 | 0x00010000 | 0x4 | 0x40 | 0x100,
-            12,
-            12,
-            400,
-            110,
-            parent,
-            1,
-            instance,
-            null(),
-        );
-        if edit == 0 {
-            DestroyWindow(parent);
-            let _ = ready_tx.send((0, 0));
-            return;
-        }
-        SetForegroundWindow(parent);
-        SetFocus(edit);
-        SendMessageW(edit, 0xb1, 0, 9); // EM_SETSEL: select exactly "Transpose".
-        let _ = ready_tx.send((parent, edit));
-        let mut message: Message = zeroed();
-        while GetMessageW(&mut message, 0, 0, 0) > 0 {
-            TranslateMessage(&message);
-            DispatchMessageW(&message);
-        }
+    let reader = thread::spawn(move || {
+        let mut line = String::new();
+        let result = BufReader::new(stdout)
+            .read_line(&mut line)
+            .map(|_| line.trim().parse::<Handle>().unwrap_or(0));
+        let _ = ready_tx.send(result);
     });
-    let (parent, edit) = ready_rx
-        .recv_timeout(Duration::from_secs(5))
-        .map_err(|_| "Windows selection fixture did not start.")?;
-    if edit == 0 {
-        return Err("Windows selection fixture could not create a native text field.".into());
-    }
-    let result = (|| -> Result<String, String> {
-        let automation: IUIAutomation =
-            CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
-                .map_err(|error| format!("create UI Automation: {error}"))?;
-        let element = automation
-            .ElementFromHandle(HWND(edit as *mut c_void))
-            .map_err(|error| format!("find multiline EDIT: {error}"))?;
-        let pattern = element
-            .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
-            .map_err(|error| format!("get TextPattern on multiline EDIT: {error}"))?;
-        let ranges = pattern
-            .GetSelection()
-            .map_err(|error| format!("read selected ranges: {error}"))?;
-        let count = ranges
-            .Length()
-            .map_err(|error| format!("count selected ranges: {error}"))?;
-        if count < 1 {
-            return Err("multiline EDIT returned no selected range".into());
+    let hwnd = ready_rx
+        .recv_timeout(Duration::from_secs(10))
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(0);
+    let result = if hwnd == 0 {
+        let _ = fixture.kill();
+        let _ = fixture.wait();
+        let mut error = String::new();
+        if let Some(mut stderr) = fixture.stderr.take() {
+            let _ = stderr.read_to_string(&mut error);
         }
-        let range = ranges
-            .GetElement(0)
-            .map_err(|error| format!("read first selected range: {error}"))?;
-        let text = range
-            .GetText(100)
-            .map_err(|error| format!("read selected text: {error}"))?;
-        Ok(text.to_string())
-    })();
-    PostMessageW(parent, 0x10, 0, 0);
-    let _ = owner.join();
+        Err(format!(
+            "The WPF selection fixture did not expose a window: {}",
+            error.trim()
+        ))
+    } else {
+        (|| -> Result<String, String> {
+            let automation: IUIAutomation =
+                CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
+                    .map_err(|error| format!("create UI Automation: {error}"))?;
+            let root = automation
+                .ElementFromHandle(HWND(hwnd as *mut c_void))
+                .map_err(|error| format!("find WPF fixture: {error}"))?;
+            let walker = automation
+                .ControlViewWalker()
+                .map_err(|error| format!("create WPF tree walker: {error}"))?;
+            let mut queue = vec![root];
+            let mut checked = 0;
+            let mut found = None;
+            while let Some(element) = queue.pop() {
+                checked += 1;
+                if checked > 64 {
+                    break;
+                }
+                if let Ok(pattern) =
+                    element.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+                {
+                    let ranges = pattern
+                        .GetSelection()
+                        .map_err(|error| format!("read WPF selected ranges: {error}"))?;
+                    if ranges.Length().map_err(|error| error.to_string())? > 0 {
+                        let text = ranges
+                            .GetElement(0)
+                            .and_then(|range| range.GetText(100))
+                            .map_err(|error| format!("read WPF selected text: {error}"))?
+                            .to_string();
+                        if !text.is_empty() {
+                            found = Some((element, text));
+                            break;
+                        }
+                    }
+                }
+                let mut child = walker.GetFirstChildElement(&element).ok();
+                while let Some(element) = child {
+                    child = walker.GetNextSiblingElement(&element).ok();
+                    queue.push(element);
+                }
+            }
+            let (element, text) = found.ok_or_else(|| {
+                format!("WPF fixture exposed no selected TextPattern in {checked} UIA elements.")
+            })?;
+            element
+                .SetFocus()
+                .map_err(|error| format!("focus WPF text fixture: {error}"))?;
+            // Also run the production selection reader against this other
+            // process. The fixture owns focus and contains no password fields.
+            let request = ReadRequest {
+                anchor: (80, 80),
+                foreground: hwnd,
+                generation: 0,
+            };
+            let production = read_selection(&automation,&request).ok_or_else(||format!("The production reader could not read the WPF selection (foreground={:#x}, fixture={:#x}).",GetForegroundWindow(),hwnd))?;
+            if production.0 != text {
+                return Err("The production reader and direct TextPattern returned different selected text.".into());
+            }
+            Ok(text)
+        })()
+    };
+    if hwnd != 0 {
+        PostMessageW(hwnd, 0x10, 0, 0);
+    }
+    // Ensure a failed diagnostic leaves no PowerShell window or child process.
+    let _ = fixture.kill();
+    let _ = fixture.wait();
+    let _ = reader.join();
     result.map_err(|error| format!("Windows UI Automation selection fixture failed: {error}"))
-}
-
-unsafe extern "system" fn diagnostic_window_proc(
-    hwnd: Handle,
-    message: u32,
-    wparam: usize,
-    lparam: isize,
-) -> isize {
-    match message {
-        0x10 => {
-            DestroyWindow(hwnd);
-            return 0;
-        }
-        0x2 => {
-            PostQuitMessage(0);
-            return 0;
-        }
-        _ => {}
-    }
-    DefWindowProcW(hwnd, message, wparam, lparam)
 }
 
 unsafe extern "system" fn mouse_hook(code: i32, wparam: usize, lparam: isize) -> isize {
