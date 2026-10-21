@@ -70,6 +70,16 @@ func runSelectionChecks() throws -> Int {
     checks += try require(SelectionPolicy.permitsDeferred(bundle: chatBundles[0], gesture: .drag(distance: 20),
                                                         target: SelectionPolicy.TargetFacts()),
                           "Unavailable AX facts may offer an explicit action; an interrupted inspection may not")
+    checks += try require(SelectionPolicy.permitsExplicitChatKeyboardCopy(bundle: "com.tencent.xinWeChat", target: safeTarget),
+                          "A safe WeChat selection can use keyboard Copy after an explicit button click")
+    for bundle: String? in ["com.electron.lark", "com.google.Chrome", "com.tencent.xinWeChat.extra", nil] {
+        checks += try require(!SelectionPolicy.permitsExplicitChatKeyboardCopy(bundle: bundle, target: safeTarget),
+                              "The exceptional explicit keyboard Copy path is limited to the exact WeChat bundle")
+    }
+    for target in unsafeTargets {
+        checks += try require(!SelectionPolicy.permitsExplicitChatKeyboardCopy(bundle: "com.tencent.xinWeChat", target: target),
+                              "WeChat keyboard Copy rejects protected, editable, window chrome, foreign and incomplete targets")
+    }
 
     // Mouse-up only decides whether to offer a button. The policy supplies no
     // automatic-copy operation; clipboard decisions below model an explicit click.
@@ -77,6 +87,9 @@ func runSelectionChecks() throws -> Int {
     let untouchedClipboard = SelectionPolicy.clipboardDecision(originalCount: 8, observedCount: 8, text: "old clipboard",
                                                                sameApplication: true, sameGeneration: true, userRequestedCopy: false)
     checks += try require(offeredOnMouseUp && untouchedClipboard == .wait, "Offering an action does not turn existing clipboard text into a selection")
+    checks += try require(SelectionPolicy.permitsExplicitChatKeyboardCopy(bundle: "com.tencent.xinWeChat", target: safeTarget)
+                          && untouchedClipboard == .wait,
+                          "Checking explicit WeChat Copy eligibility does not consume clipboard text during a gesture")
 
     checks += try require(SelectionPolicy.isCurrent(originPID: 42, generation: 9, currentPID: 42, currentGeneration: 9,
                                                   enabled: true, cancelled: false), "Current read may complete")
@@ -156,6 +169,15 @@ func runSelectionChecks() throws -> Int {
     text = selection(in: [0: Node(selection: " \n ", children: [2]), 1: Node(selection: "hit-test selection"),
                           2: Node(selection: "focused descendant")], seeds: [0, 1], reads: &reads, expanded: &expanded)
     checks += try require(text == "hit-test selection" && reads == [0, 1], "Hit-test seed is checked before unrelated focused descendants")
+
+    reads = []; expanded = []
+    let deferredSourceTree = [10: Node(children: [12]), 11: Node(),
+                              12: Node(selection: "original source selection"),
+                              99: Node(selection: "foreign overlay text")]
+    text = selection(in: deferredSourceTree, seeds: [10, 11], reads: &reads, expanded: &expanded)
+    checks += try require(text == "original source selection", "Deferred selection resolves from retained source gesture endpoints")
+    checks += try require(!reads.contains(99) && reads == [10, 11, 12],
+                          "A foreign overlay under the current pointer is never used as a source seed")
 
     reads = []; expanded = []
     text = selection(in: [0: Node(selection: "secret", children: [1], protected: true),

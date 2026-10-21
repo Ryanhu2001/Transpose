@@ -92,6 +92,11 @@ enum SelectionPolicy {
         }
     }
 
+    static func permitsExplicitChatKeyboardCopy(bundle: String?, target: TargetFacts) -> Bool {
+        bundle == "com.tencent.xinWeChat" && !target.protected && !target.riskyEditable
+            && !target.windowChrome && target.belongsToSource && !target.incomplete
+    }
+
     static func isEditMenu(title: String?) -> Bool {
         guard let title = title?.trimmingCharacters(in: .whitespacesAndNewlines) else { return false }
         return ["Edit", "编辑", "編輯", "編集"].contains(title)

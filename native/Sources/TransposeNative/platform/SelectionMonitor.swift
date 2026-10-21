@@ -10,6 +10,12 @@ struct DeferredSelection {
     fileprivate let generation: Int
     fileprivate let bundleIdentifier: String?
     fileprivate let gesturePoint: NSPoint
+    fileprivate let context: SelectionReadContext
+}
+
+fileprivate struct SelectionReadContext: @unchecked Sendable {
+    let target: SelectionPolicy.TargetFacts
+    let endpoints: [AXUIElement]
 }
 
 /// Automatic selection monitoring reads AX only. Copying is reserved for an
@@ -98,10 +104,19 @@ final class SelectionMonitor {
     /// if the user has moved to another app, the deferred selection has expired.
     func resolve(_ deferred: DeferredSelection) async -> SelectedContent? {
         guard Self.isTrusted, isCurrent(pid: deferred.pid, request: deferred.generation),
-              !clipboardReadInProgress else { return nil }
+              !clipboardReadInProgress else {
+            diagnose("resolve", reason: "expired_or_busy", bundle: deferred.bundleIdentifier)
+            return nil
+        }
+        // The loading panel may already cover the source selection. Use the
+        // original AX targets rather than hit-testing through our own window.
         let result = await reader.read(pid: deferred.pid, bundleIdentifier: deferred.bundleIdentifier,
-                                       point: quartzPoint(deferred.gesturePoint))
-        guard isCurrent(pid: deferred.pid, request: deferred.generation), result.canCopy else { return nil }
+                                       point: nil, context: deferred.context)
+        guard isCurrent(pid: deferred.pid, request: deferred.generation), result.canCopy else {
+            diagnose("resolve", reason: result.target.protected ? "protected" : result.target.incomplete ? "ax_budget" : "target_rejected",
+                     bundle: deferred.bundleIdentifier)
+            return nil
+        }
         if let text = result.text {
             return SelectedContent(text: text, anchor: deferred.anchor, sourceApp: deferred.sourceApp)
         }
@@ -109,9 +124,17 @@ final class SelectionMonitor {
                                               gesture: .keyboardSelection, target: result.target) else { return nil }
         clipboardReadInProgress = true
         defer { clipboardReadInProgress = false }
-        guard let text = await copySelection(from: deferred.pid, request: deferred.generation),
+        guard let text = await copySelection(from: deferred.pid, request: deferred.generation,
+                                             chatContext: result.context),
               isCurrent(pid: deferred.pid, request: deferred.generation) else { return nil }
         return SelectedContent(text: text, anchor: deferred.anchor, sourceApp: deferred.sourceApp)
+    }
+
+    private func diagnose(_ phase: String, reason: String, bundle: String?) {
+        guard ProcessInfo.processInfo.arguments.contains("--selection-diagnostic") else { return }
+        let report = ["selectionPhase": phase, "reason": reason, "bundle": bundle ?? "unknown"]
+        if let data = try? JSONSerialization.data(withJSONObject: report, options: .sortedKeys),
+           let json = String(data: data, encoding: .utf8) { fputs(json + "\n", stderr) }
     }
 
     private func sourceApplication() -> NSRunningApplication? {
@@ -208,20 +231,22 @@ final class SelectionMonitor {
                 self.lastDelivered = nil
                 guard SelectionPolicy.permitsDeferred(bundle: bundle, gesture: gesture, target: result.target) else { return }
                 self.onDeferredSelection?(DeferredSelection(pid: pid, sourceApp: appName, anchor: anchor,
-                                                           generation: request, bundleIdentifier: bundle, gesturePoint: anchor))
+                                                           generation: request, bundleIdentifier: bundle, gesturePoint: anchor, context: result.context))
             }
         }
     }
 
-    private func copySelection(from pid: pid_t, request: Int, requireEnabled: Bool = true) async -> String? {
+    private func copySelection(from pid: pid_t, request: Int, requireEnabled: Bool = true,
+                               chatContext: SelectionReadContext? = nil) async -> String? {
         let cancellation = SelectionCancellation()
         return await withTaskCancellationHandler(operation: {
-            await performCopySelection(from: pid, request: request, requireEnabled: requireEnabled, cancellation: cancellation)
+            await performCopySelection(from: pid, request: request, requireEnabled: requireEnabled, cancellation: cancellation, chatContext: chatContext)
         }, onCancel: { cancellation.cancel() })
     }
 
     private func performCopySelection(from pid: pid_t, request: Int, requireEnabled: Bool,
-                                      cancellation: SelectionCancellation) async -> String? {
+                                      cancellation: SelectionCancellation, chatContext: SelectionReadContext?) async -> String? {
+        let bundle = sourceApplication()?.bundleIdentifier
         let pasteboard = NSPasteboard.general
         // Promised formats can involve IPC. Materialize off the event loop,
         // abandoning snapshots larger than 4 MiB or slower than 120 ms.
@@ -229,7 +254,10 @@ final class SelectionMonitor {
             clipboardQueue.async { continuation.resume(returning: ClipboardSnapshot(NSPasteboard.general)) }
         }
         guard let snapshot = captured, isCurrent(pid: pid, request: request, requireEnabled: requireEnabled),
-              pasteboard.changeCount == snapshot.changeCount else { return nil }
+              pasteboard.changeCount == snapshot.changeCount else {
+            diagnose("copy", reason: "snapshot_or_expired", bundle: bundle)
+            return nil
+        }
 
         let attempt = ClipboardCopyAttempt()
         let realCopyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { event in
@@ -257,21 +285,29 @@ final class SelectionMonitor {
             }
         }
         switch menuResult {
-        case .disabled: return nil
+        case .disabled:
+            diagnose("copy", reason: "menu_unavailable_or_disabled", bundle: bundle)
+            // WeChat exposes a disabled or incomplete standard Copy menu for
+            // some message selections that do support an explicit Cmd-C.
+            // This exception is confined to the user's translation-button
+            // click and requires a fresh protected-control check below.
+            guard let chatContext,
+                  SelectionPolicy.permitsExplicitChatKeyboardCopy(bundle: bundle, target: chatContext.target),
+                  await reader.allowsChatKeyboardCopy(pid: pid, context: chatContext),
+                  !cancellation.isCancelled, isCurrent(pid: pid, request: request, requireEnabled: requireEnabled),
+                  !attempt.userRequestedCopy, pasteboard.changeCount == snapshot.changeCount,
+                  postCopyKey() else { return nil }
         case .invoked:
             // Copy has already been sent. Even a cancelled originating task
             // must observe its bounded clipboard cleanup below.
             break
         case .unavailable:
+            if let chatContext, bundle == "com.tencent.xinWeChat" {
+                guard await reader.allowsChatKeyboardCopy(pid: pid, context: chatContext) else { return nil }
+            }
             guard !cancellation.isCancelled, isCurrent(pid: pid, request: request, requireEnabled: requireEnabled),
                   !attempt.userRequestedCopy, pasteboard.changeCount == snapshot.changeCount else { return nil }
-            guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 8, keyDown: true),
-                  let up = CGEvent(keyboardEventSource: nil, virtualKey: 8, keyDown: false) else { return nil }
-            for event in [down, up] {
-                event.flags = .maskCommand
-                event.setIntegerValueField(.eventSourceUserData, value: Self.copyEventTag)
-                event.post(tap: .cghidEventTap)
-            }
+            guard postCopyKey() else { return nil }
         }
 
         // A cancelled task still gets bounded cleanup for its own text copy.
@@ -289,14 +325,28 @@ final class SelectionMonitor {
                 userRequestedCopy: attempt.userRequestedCopy)
             switch decision {
             case .wait: continue
-            case .abandon: return nil
+            case .abandon:
+                diagnose("copy", reason: "clipboard_superseded_or_nontext", bundle: bundle)
+                return nil
             case .acceptAndRestore(let text):
                 // No suspension between the final count check and restoration.
                 guard snapshot.restore(to: pasteboard, onlyIfChangeCount: copiedCount) else { return nil }
                 return cancellation.isCancelled || Task.isCancelled ? nil : text
             }
         }
+        diagnose("copy", reason: "copy_no_write", bundle: bundle)
         return nil
+    }
+
+    private func postCopyKey() -> Bool {
+        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 8, keyDown: true),
+              let up = CGEvent(keyboardEventSource: nil, virtualKey: 8, keyDown: false) else { return false }
+        for event in [down, up] {
+            event.flags = .maskCommand
+            event.setIntegerValueField(.eventSourceUserData, value: Self.copyEventTag)
+            event.post(tap: .cghidEventTap)
+        }
+        return true
     }
 }
 
@@ -351,16 +401,19 @@ private final class AccessibilitySelectionReader: @unchecked Sendable {
         let text: String?
         let canCopy: Bool
         let target: SelectionPolicy.TargetFacts
+        var endpoints: [AXUIElement] = []
+        var context: SelectionReadContext { SelectionReadContext(target: target, endpoints: endpoints) }
     }
     private let queue = DispatchQueue(label: "transpose.selection.ax", qos: .userInitiated)
     private var enabledChromiumPIDs = Set<pid_t>()
     private var activeDeadline = TimeInterval.greatestFiniteMagnitude
 
-    func read(pid: pid_t, bundleIdentifier: String?, point: CGPoint?, startPoint: CGPoint? = nil) async -> Result {
+    func read(pid: pid_t, bundleIdentifier: String?, point: CGPoint?, startPoint: CGPoint? = nil,
+              context: SelectionReadContext? = nil) async -> Result {
         await withCheckedContinuation { continuation in
             queue.async { [self] in
                 continuation.resume(returning: readSynchronously(pid: pid, bundleIdentifier: bundleIdentifier,
-                                                                 point: point, startPoint: startPoint))
+                                                                 point: point, startPoint: startPoint, context: context))
             }
         }
     }
@@ -371,7 +424,8 @@ private final class AccessibilitySelectionReader: @unchecked Sendable {
         }
     }
 
-    private func readSynchronously(pid: pid_t, bundleIdentifier: String?, point: CGPoint?, startPoint: CGPoint?) -> Result {
+    private func readSynchronously(pid: pid_t, bundleIdentifier: String?, point: CGPoint?, startPoint: CGPoint?,
+                                   context: SelectionReadContext?) -> Result {
         let application = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(application, 0.08)
         let deadline = ProcessInfo.processInfo.systemUptime + 0.55
@@ -385,11 +439,11 @@ private final class AccessibilitySelectionReader: @unchecked Sendable {
         // Inspect the actual gesture targets before spending time walking
         // ancestor chains. Unsupported attributes are valid for WeChat; an
         // exhausted time budget must never masquerade as a safe target.
-        let rawHit = point.flatMap { hitTest(point: $0) }
-        let rawStartHit = startPoint.flatMap { hitTest(point: $0) }
+        let rawHit = context?.endpoints.first ?? point.flatMap { hitTest(point: $0) }
+        let rawStartHit = context?.endpoints.dropFirst().first ?? startPoint.flatMap { hitTest(point: $0) }
         let hit = rawHit.flatMap { belongs($0, to: pid) ? $0 : nil }
         let startHit = rawStartHit.flatMap { belongs($0, to: pid) ? $0 : nil }
-        var facts = SelectionPolicy.TargetFacts()
+        var facts = context?.target ?? SelectionPolicy.TargetFacts()
         facts.belongsToSource = [rawHit, rawStartHit].compactMap { $0 }.allSatisfy { belongs($0, to: pid) }
         let directTargets = [hit, startHit].compactMap { $0 }
         facts.protected = directTargets.contains(where: isProtected)
@@ -400,7 +454,7 @@ private final class AccessibilitySelectionReader: @unchecked Sendable {
             return Result(text: nil, canCopy: false, target: facts)
         }
         let focused = element(attribute: kAXFocusedUIElementAttribute, of: application)
-        if hit == nil { facts.riskyEditable = focused.map(isRiskyEditable) ?? false }
+        if hit == nil && context == nil { facts.riskyEditable = focused.map(isRiskyEditable) ?? false }
         let hitChain = chain(from: hit, deadline: deadline)
         let startChain = chain(from: startHit, deadline: deadline)
         let focusedChain = chain(from: focused, deadline: deadline)
@@ -433,7 +487,23 @@ private final class AccessibilitySelectionReader: @unchecked Sendable {
         }
         facts.incomplete = !before(deadline)
         return Result(text: nil, canCopy: !facts.protected && !facts.windowChrome && !facts.riskyEditable && !facts.incomplete,
-                      target: facts)
+                      target: facts, endpoints: directTargets)
+    }
+
+    func allowsChatKeyboardCopy(pid: pid_t, context: SelectionReadContext) async -> Bool {
+        await withCheckedContinuation { continuation in
+            queue.async { [self] in
+                let deadline = ProcessInfo.processInfo.systemUptime + 0.25
+                activeDeadline = deadline
+                defer { activeDeadline = .greatestFiniteMagnitude }
+                let application = AXUIElementCreateApplication(pid)
+                AXUIElementSetMessagingTimeout(application, 0.05)
+                let focused = element(attribute: kAXFocusedUIElementAttribute, of: application)
+                let candidates = context.endpoints + chain(from: focused, deadline: deadline)
+                let protected = candidates.contains(where: isProtected)
+                continuation.resume(returning: !protected && before(deadline))
+            }
+        }
     }
 
     private func pressCopySynchronously(pid: pid_t, allowed: () -> Bool) -> SelectionPolicy.CopyMenuResult {

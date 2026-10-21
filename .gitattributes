@@ -1,0 +1,2 @@
+# Signature fixtures must retain the exact bytes signed on every platform.
+tests/fixtures/updater/** -text
