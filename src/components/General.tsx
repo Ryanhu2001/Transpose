@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import { useState } from "react";
 import { PermissionSetup } from "./PermissionSetup";
+import { UpdateSettings } from "./UpdateSettings";
 import { platformFeatures } from "../lib/platform";
 import type { NativeClient } from "../lib/useNative";
 import {
@@ -330,6 +331,7 @@ export function General({
           )}
         </p>
       </section>
+      <UpdateSettings client={client} t={t} />
     </>
   );
 }

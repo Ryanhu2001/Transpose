@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import { startResultWindowDrag } from "../../src/lib/resultWindow";
+import {
+  RESULT_RESIZE_DIRECTIONS,
+  startResultWindowDrag,
+  startResultWindowResize,
+} from "../../src/lib/resultWindow";
 
 function pointer(overrides: Record<string, unknown> = {}) {
   return {
@@ -57,5 +61,56 @@ describe("translation window dragging", () => {
     await expect(startResultWindowDrag(pointer(), move)).rejects.toThrow(
       "The window is unavailable.",
     );
+  });
+});
+
+describe("translation window resizing", () => {
+  it.each(RESULT_RESIZE_DIRECTIONS)(
+    "hands %s resizing to the native window and prevents title dragging",
+    async (direction) => {
+      const event = pointer();
+      const resize = vi.fn(async () => {});
+      await expect(
+        startResultWindowResize(event, direction, resize),
+      ).resolves.toBe(true);
+      expect(resize).toHaveBeenCalledExactlyOnceWith(direction);
+      expect(event.preventDefault).toHaveBeenCalledOnce();
+      expect(event.stopPropagation).toHaveBeenCalledOnce();
+    },
+  );
+
+  it.each([{ button: 1 }, { button: 2 }, { isPrimary: false }])(
+    "ignores unsupported resize pointers %j",
+    async (overrides) => {
+      const event = pointer(overrides);
+      const resize = vi.fn(async () => {});
+      await expect(
+        startResultWindowResize(event, "SouthEast", resize),
+      ).resolves.toBe(false);
+      expect(resize).not.toHaveBeenCalled();
+      expect(event.preventDefault).not.toHaveBeenCalled();
+    },
+  );
+
+  it("accepts the visible resize button without treating it as a title control", async () => {
+    const event = pointer({
+      target: {
+        closest: () => ({ tagName: "BUTTON" }),
+      } as unknown as EventTarget,
+    });
+    const resize = vi.fn(async () => {});
+    await expect(
+      startResultWindowResize(event, "SouthEast", resize),
+    ).resolves.toBe(true);
+    expect(resize).toHaveBeenCalledOnce();
+  });
+
+  it("reports native resize failures for the result UI to display", async () => {
+    const resize = vi.fn(async () => {
+      throw new Error("The window is unavailable.");
+    });
+    await expect(
+      startResultWindowResize(pointer(), "East", resize),
+    ).rejects.toThrow("The window is unavailable.");
   });
 });

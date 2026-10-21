@@ -75,6 +75,11 @@ try {
         if (-not $report.ocrLanguages -or @($report.ocrLanguages).Count -eq 0 -or $report.networkRequests -ne 0) {
             throw "The Windows platform check needs an OCR language and must not make network requests."
         }
+        foreach ($check in @("edit", "richEdit", "utf16AndParagraphOffsets", "passwordProtected", "clipboardUnchanged")) {
+            if ($report.legacySelection.$check -ne $true) {
+                throw "The Windows legacy selection check failed: $check."
+            }
+        }
     } elseif ($report.tauri -ne $true -or $report.frontend -ne $true -or $report.nativeBridge -ne $true) {
         throw "The Windows app reported an unavailable frontend or native bridge."
     }

@@ -199,6 +199,7 @@ describe("Windows settings", () => {
     expect(html).toContain('aria-label="Pin window"');
     expect(html).toContain('aria-label="Close"');
     expect(html).toContain('aria-label="Resize translation window"');
+    expect(html.match(/data-resize-direction=/g)).toHaveLength(8);
   });
 
   it("leaves native macOS result resizing with the existing system bridge", async () => {
@@ -208,6 +209,7 @@ describe("Windows settings", () => {
     );
 
     expect(html).not.toContain("result-resize-handle");
+    expect(html).not.toContain("data-resize-direction");
     expect(html).toMatch(/<header[^>]*data-tauri-drag-region="deep"/);
   });
 });

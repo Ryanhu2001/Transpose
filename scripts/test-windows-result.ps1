@@ -252,6 +252,7 @@ try {
     Assert-Visible "before interaction"
     $before = Window-Bounds
     $checks.initialBounds = $before
+    $checks.initialClientSize = Client-Size
     $checks.dpi = 96 * $script:scale
     Save-Screenshot "01-ready"
 
@@ -311,11 +312,77 @@ try {
     $checks.copyClick = $true
     Save-Checks
 
+    # Resizing an edge must follow that edge and keep its opposite edge fixed.
+    # Hit the transparent native resize zones rather than the southeast grip.
+    $size = Client-Size
+    $edgeBounds = Window-Bounds
+    $east = Client-Point ($size.width - 3) ($size.height / 2)
+    $eastDelta = [int][Math]::Round(72 * $script:scale)
+    [TransposeResultInput]::Drag($east.X, $east.Y, $east.X + $eastDelta, $east.Y)
+    Start-Sleep -Milliseconds 500
+    $eastSize = Client-Size
+    $eastBounds = Window-Bounds
+    $checks.eastEdgeClientSize = $eastSize
+    $checks.eastEdgeBounds = $eastBounds
+    Save-Checks
+    if ([Math]::Abs($eastSize.width - $size.width - 72) -gt 8 -or
+        [Math]::Abs($eastBounds.left - $edgeBounds.left) -gt 3 -or
+        [Math]::Abs($eastSize.height - $size.height) -gt 3) {
+        throw "Dragging the east edge did not resize its width while keeping the other edges fixed."
+    }
+    Assert-Visible "after resizing its east edge"
+    $checks.eastEdgeResize = $true
+    Save-Checks
+
+    $west = Client-Point 3 ($eastSize.height / 2)
+    $westDelta = [int][Math]::Round(56 * $script:scale)
+    [TransposeResultInput]::Drag($west.X, $west.Y, $west.X - $westDelta, $west.Y)
+    Start-Sleep -Milliseconds 500
+    $westSize = Client-Size
+    $westBounds = Window-Bounds
+    $checks.westEdgeClientSize = $westSize
+    $checks.westEdgeBounds = $westBounds
+    Save-Checks
+    if ([Math]::Abs($westSize.width - $eastSize.width - 56) -gt 8 -or
+        [Math]::Abs($westBounds.right - $eastBounds.right) -gt 3 -or
+        [Math]::Abs($westBounds.left - $eastBounds.left + $westDelta) -gt 8 -or
+        [Math]::Abs($westSize.height - $eastSize.height) -gt 3) {
+        throw "Dragging the west edge did not move that edge while keeping the east edge fixed."
+    }
+    Assert-Visible "after resizing its west edge"
+    $checks.westEdgeResize = $true
+    Save-Checks
+
+    $north = Client-Point ($westSize.width / 2) 3
+    $northDelta = [int][Math]::Round(32 * $script:scale)
+    [TransposeResultInput]::Drag($north.X, $north.Y, $north.X, $north.Y - $northDelta)
+    Start-Sleep -Milliseconds 500
+    $northSize = Client-Size
+    $northBounds = Window-Bounds
+    $checks.northEdgeClientSize = $northSize
+    $checks.northEdgeBounds = $northBounds
+    Save-Checks
+    if ([Math]::Abs($northSize.height - $westSize.height - 32) -gt 8 -or
+        [Math]::Abs($northBounds.bottom - $westBounds.bottom) -gt 3 -or
+        [Math]::Abs($northBounds.top - $westBounds.top + $northDelta) -gt 8 -or
+        [Math]::Abs($northSize.width - $westSize.width) -gt 3) {
+        throw "Dragging the north edge did not move that edge while keeping the south edge fixed."
+    }
+    Assert-Visible "after resizing its north edge"
+    $checks.northEdgeResize = $true
+    $checks.edgeResizedBounds = $northBounds
+    Save-Checks
+    Save-Screenshot "03-edges"
+
+    $size = Client-Size
     $resize = Client-Point ($size.width - 7) ($size.height - 7)
     $tooSmall = Client-Point 90 80
     [TransposeResultInput]::Drag($resize.X, $resize.Y, $tooSmall.X, $tooSmall.Y)
     Start-Sleep -Milliseconds 500
     $minimumSize = Client-Size
+    $checks.minimumClientSize = $minimumSize
+    $checks.minimumOuterBounds = Window-Bounds
+    Save-Checks
     $minimumWidth = if ($report.window.minWidth) { [double]$report.window.minWidth } else { 360 }
     $minimumHeight = if ($report.window.minHeight) { [double]$report.window.minHeight } else { 180 }
     if ($minimumSize.width -lt $minimumWidth - 2 -or $minimumSize.height -lt $minimumHeight - 2) {
@@ -326,9 +393,8 @@ try {
     }
     Assert-Visible "after resizing"
     $checks.minimumResize = $true
-    $checks.minimumClientSize = $minimumSize
     Save-Checks
-    Save-Screenshot "03-minimum"
+    Save-Screenshot "04-minimum"
 
     $close = Client-Point ($minimumSize.width - 25) 22
     [TransposeResultInput]::Click($close.X, $close.Y)

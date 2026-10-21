@@ -9,9 +9,13 @@ import {
   X,
 } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { useEffect, useState } from "react";
+import { useEffect, useState, type PointerEvent } from "react";
 import type { NativeClient } from "../lib/useNative";
-import { startResultWindowDrag } from "../lib/resultWindow";
+import {
+  RESULT_RESIZE_DIRECTIONS,
+  startResultWindowDrag,
+  startResultWindowResize,
+} from "../lib/resultWindow";
 import { Brand, type Translator } from "./common";
 export function Result({ client, t }: { client: NativeClient; t: Translator }) {
   const result = client.state?.result;
@@ -39,6 +43,20 @@ export function Result({ client, t }: { client: NativeClient; t: Translator }) {
     } catch {
       /* client displays error */
     }
+  };
+  const resize = (
+    event: PointerEvent<HTMLElement>,
+    direction: (typeof RESULT_RESIZE_DIRECTIONS)[number],
+  ) => {
+    if (client.mode !== "tauri") return;
+    setWindowError("");
+    void startResultWindowResize(event, direction, (edge) =>
+      getCurrentWindow().startResizeDragging(edge),
+    ).catch(() =>
+      setWindowError(
+        t("Unable to resize this window.", "暂时无法调整窗口大小。"),
+      ),
+    );
   };
   return (
     <div className="result-shell">
@@ -168,27 +186,31 @@ export function Result({ client, t }: { client: NativeClient; t: Translator }) {
         </div>
       </footer>
       {isWindows && (
-        <button
-          className="result-resize-handle"
-          aria-label={t("Resize translation window", "调整译文窗口大小")}
-          tabIndex={-1}
-          onPointerDown={(event) => {
-            if (event.button !== 0 || client.mode !== "tauri") return;
-            event.preventDefault();
-            setWindowError("");
-            void getCurrentWindow()
-              .startResizeDragging("SouthEast")
-              .catch(() =>
-                setWindowError(
-                  t("Unable to resize this window.", "暂时无法调整窗口大小。"),
-                ),
-              );
-          }}
-        >
-          <svg viewBox="0 0 16 16" aria-hidden="true">
-            <path d="M5 13 13 5M10 13l3-3" />
-          </svg>
-        </button>
+        <div className="result-resize-borders">
+          {RESULT_RESIZE_DIRECTIONS.map((direction) =>
+            direction === "SouthEast" ? (
+              <button
+                key={direction}
+                className="result-resize-handle"
+                data-resize-direction={direction}
+                aria-label={t("Resize translation window", "调整译文窗口大小")}
+                tabIndex={-1}
+                onPointerDown={(event) => resize(event, direction)}
+              >
+                <svg viewBox="0 0 16 16" aria-hidden="true">
+                  <path d="M5 13 13 5M10 13l3-3" />
+                </svg>
+              </button>
+            ) : (
+              <span
+                key={direction}
+                data-resize-direction={direction}
+                aria-hidden="true"
+                onPointerDown={(event) => resize(event, direction)}
+              />
+            ),
+          )}
+        </div>
       )}
     </div>
   );

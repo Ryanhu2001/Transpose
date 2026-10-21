@@ -15,6 +15,51 @@ static BACKEND: OnceLock<Arc<Backend>> = OnceLock::new();
 static ANCHOR: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 static LAST_RESULT: Mutex<Option<String>> = Mutex::new(None);
 static RESULT_TEST_READY: AtomicBool = AtomicBool::new(false);
+static RESULT_MINIMUM: Mutex<Option<tauri::PhysicalSize<u32>>> = Mutex::new(None);
+
+fn result_minimum_size(
+    scale: f64,
+    outer: tauri::PhysicalSize<u32>,
+    inner: tauri::PhysicalSize<u32>,
+) -> tauri::PhysicalSize<u32> {
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    tauri::PhysicalSize::new(
+        (360.0 * scale).ceil() as u32 + outer.width.saturating_sub(inner.width),
+        (180.0 * scale).ceil() as u32 + outer.height.saturating_sub(inner.height),
+    )
+}
+
+fn refresh_result_minimum(window: &WebviewWindow) {
+    let (Ok(outer), Ok(inner), Ok(scale)) = (
+        window.outer_size(),
+        window.inner_size(),
+        window.scale_factor(),
+    ) else {
+        return;
+    };
+    // Tao's undecorated WM_GETMINMAXINFO treats this constraint as an outer
+    // size even while the Windows shadow still has a non-client frame. Measure
+    // that frame so the WebView retains at least 360 × 180 logical pixels.
+    let minimum = result_minimum_size(scale, outer, inner);
+    let changed = RESULT_MINIMUM
+        .lock()
+        .map(|mut previous| {
+            if *previous == Some(minimum) {
+                false
+            } else {
+                *previous = Some(minimum);
+                true
+            }
+        })
+        .unwrap_or(true);
+    if changed {
+        let _ = window.set_min_size(Some(minimum));
+    }
+}
 
 fn result_test_enabled() -> bool {
     std::env::args().any(|arg| arg == "--windows-result-test")
@@ -41,7 +86,7 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let handle = app.handle().clone();
     state.set_emitter(Arc::new(move |event| emit_event(&handle, event)));
 
-    WebviewWindowBuilder::new(app, "result", WebviewUrl::App("index.html#result".into()))
+    let result_window = WebviewWindowBuilder::new(app, "result", WebviewUrl::App("index.html#result".into()))
         .title("Transpose")
         .inner_size(460.0, 280.0)
         .min_inner_size(360.0, 180.0)
@@ -74,6 +119,7 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             )
         })
         .build()?;
+    refresh_result_minimum(&result_window);
     if smoke && !result_test {
         state.set_platform_status(true, false);
         return Ok(());
@@ -412,6 +458,14 @@ fn install_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
 pub fn window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
     if window.label() == "result" {
+        if matches!(
+            event,
+            tauri::WindowEvent::Resized(_) | tauri::WindowEvent::ScaleFactorChanged { .. }
+        ) {
+            if let Some(result) = window.app_handle().get_webview_window("result") {
+                refresh_result_minimum(&result);
+            }
+        }
         if let tauri::WindowEvent::CloseRequested { api, .. } = event {
             api.prevent_close();
             if let Ok(state) = backend() {
@@ -426,7 +480,27 @@ pub fn window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
 
 #[cfg(test)]
 mod tests {
-    use super::window_allowed;
+    use super::{result_minimum_size, window_allowed};
+    #[test]
+    fn minimum_preserves_client_area_with_undecorated_windows_frame() {
+        let size = |width, height| tauri::PhysicalSize::new(width, height);
+        assert_eq!(
+            result_minimum_size(1.0, size(476, 289), size(460, 280)),
+            size(376, 189)
+        );
+        assert_eq!(
+            result_minimum_size(1.5, size(714, 434), size(690, 420)),
+            size(564, 284)
+        );
+        assert_eq!(
+            result_minimum_size(2.0, size(952, 578), size(920, 560)),
+            size(752, 378)
+        );
+        assert_eq!(
+            result_minimum_size(1.0, size(460, 280), size(460, 280)),
+            size(360, 180)
+        );
+    }
     #[test]
     fn result_cannot_modify_settings_or_execute_commands() {
         for action in [

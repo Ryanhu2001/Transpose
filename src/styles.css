@@ -1025,16 +1025,88 @@ body[data-route="result"] {
   overflow: hidden;
   background: var(--surface);
 }
-.result-resize-handle {
+.result-resize-borders {
   position: absolute;
-  right: 2px;
-  bottom: 2px;
-  width: 16px;
-  height: 16px;
+  inset: 0;
+  pointer-events: none;
+}
+.result-resize-borders > [data-resize-direction] {
+  position: absolute;
+  pointer-events: auto;
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.result-resize-borders > [data-resize-direction="North"],
+.result-resize-borders > [data-resize-direction="South"] {
+  left: 18px;
+  right: 18px;
+  height: 5px;
+  cursor: ns-resize;
+}
+.result-resize-borders > [data-resize-direction="North"] {
+  top: 0;
+  left: 14px;
+  right: 14px;
+}
+.result-resize-borders > [data-resize-direction="South"] {
+  bottom: 0;
+  right: 22px;
+}
+.result-resize-borders > [data-resize-direction="East"],
+.result-resize-borders > [data-resize-direction="West"] {
+  top: 18px;
+  bottom: 18px;
+  width: 5px;
+  cursor: ew-resize;
+}
+.result-resize-borders > [data-resize-direction="East"] {
+  right: 0;
+  top: 14px;
+  bottom: 22px;
+}
+.result-resize-borders > [data-resize-direction="West"] {
+  left: 0;
+  top: 14px;
+}
+.result-resize-borders > [data-resize-direction="NorthWest"],
+.result-resize-borders > [data-resize-direction="NorthEast"],
+.result-resize-borders > [data-resize-direction="SouthWest"],
+.result-resize-borders > [data-resize-direction="SouthEast"] {
+  width: 18px;
+  height: 18px;
+}
+.result-resize-borders > [data-resize-direction="NorthWest"],
+.result-resize-borders > [data-resize-direction="SouthEast"] {
+  cursor: nwse-resize;
+}
+.result-resize-borders > [data-resize-direction="NorthEast"],
+.result-resize-borders > [data-resize-direction="SouthWest"] {
+  cursor: nesw-resize;
+}
+.result-resize-borders > [data-resize-direction="NorthWest"] {
+  top: 0;
+  left: 0;
+  width: 14px;
+  height: 14px;
+}
+.result-resize-borders > [data-resize-direction="NorthEast"] {
+  top: 0;
+  right: 0;
+  width: 14px;
+  height: 14px;
+}
+.result-resize-borders > [data-resize-direction="SouthWest"] {
+  bottom: 0;
+  left: 0;
+}
+.result-resize-borders > .result-resize-handle {
+  right: 0;
+  bottom: 0;
+  width: 22px;
+  height: 22px;
   padding: 1px;
   color: var(--muted);
-  cursor: nwse-resize;
-  touch-action: none;
 }
 .result-resize-handle svg {
   width: 14px;
@@ -1157,6 +1229,9 @@ body[data-route="result"] {
   justify-content: space-between;
   padding: 0 22px 0 14px;
   gap: 8px;
+}
+body[data-platform="windows"] .result-footer {
+  padding-right: 26px;
 }
 .result-status {
   color: var(--muted);

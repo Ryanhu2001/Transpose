@@ -3,6 +3,7 @@
 use serde_json::{json, Value};
 #[cfg(target_os = "windows")]
 mod backend;
+mod updater;
 #[cfg(target_os = "windows")]
 mod windows_host;
 #[cfg(target_os = "windows")]
@@ -197,13 +198,15 @@ fn main() {
         println!("{report}");
         std::process::exit(if result.is_ok() { 0 } else { 1 });
     }
-    let builder = tauri::Builder::default();
+    let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(updater::AppUpdates::default());
     #[cfg(target_os = "windows")]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _, _| {
         show_settings(app);
     }));
     let app = builder
-        .invoke_handler(tauri::generate_handler![native_request, diagnostics_report])
+        .invoke_handler(tauri::generate_handler![native_request, diagnostics_report, updater::app_updates])
         .on_page_load(|window, payload| {
             if window.label() == "settings" && payload.event() == tauri::webview::PageLoadEvent::Finished && std::env::args().any(|arg| arg == "--smoke-test") {
                 let _ = window.eval(r#"

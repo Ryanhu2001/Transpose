@@ -12,6 +12,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use windows::core::Interface;
 use windows::Win32::{
     Foundation::{HWND, POINT},
     System::Com::{
@@ -19,8 +20,9 @@ use windows::Win32::{
         COINIT_MULTITHREADED,
     },
     UI::Accessibility::{
-        CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationTextPattern,
-        UIA_TextPatternId,
+        CUIAutomation, IUIAutomation, IUIAutomation2, IUIAutomationElement,
+        IUIAutomationTextChildPattern, IUIAutomationTextPattern, IUIAutomationTextPattern2,
+        IUIAutomationTreeWalker, UIA_TextChildPatternId, UIA_TextPattern2Id, UIA_TextPatternId,
     },
 };
 
@@ -131,6 +133,18 @@ struct MonitorInfo {
     flags: u32,
 }
 #[repr(C)]
+struct GuiThreadInfo {
+    size: u32,
+    flags: u32,
+    active: Handle,
+    focus: Handle,
+    capture: Handle,
+    menu_owner: Handle,
+    move_size: Handle,
+    caret: Handle,
+    caret_rect: Rect,
+}
+#[repr(C)]
 struct WindowClass {
     size: u32,
     style: u32,
@@ -218,18 +232,32 @@ unsafe extern "system" {
     fn TranslateMessage(message: *const Message) -> i32;
     fn DispatchMessageW(message: *const Message) -> isize;
     fn PostMessageW(hwnd: Handle, message: u32, wparam: usize, lparam: isize) -> i32;
+    fn SendMessageTimeoutW(
+        hwnd: Handle,
+        message: u32,
+        wparam: usize,
+        lparam: isize,
+        flags: u32,
+        timeout: u32,
+        result: *mut usize,
+    ) -> isize;
     fn PostQuitMessage(code: i32);
     fn ShowWindow(hwnd: Handle, command: i32) -> i32;
     fn DestroyWindow(hwnd: Handle) -> i32;
     fn SetWindowPos(hwnd: Handle, after: Handle, x: i32, y: i32, w: i32, h: i32, flags: u32)
         -> i32;
     fn SetWindowLongPtrW(hwnd: Handle, index: i32, value: isize) -> isize;
+    fn GetWindowLongPtrW(hwnd: Handle, index: i32) -> isize;
     fn SetLayeredWindowAttributes(hwnd: Handle, color: u32, alpha: u8, flags: u32) -> i32;
     fn SetForegroundWindow(hwnd: Handle) -> i32;
     fn GetForegroundWindow() -> Handle;
     fn GetWindowThreadProcessId(hwnd: Handle, pid: *mut u32) -> u32;
     fn GetAncestor(hwnd: Handle, flags: u32) -> Handle;
     fn GetWindowTextW(hwnd: Handle, text: *mut u16, capacity: i32) -> i32;
+    fn GetClassNameW(hwnd: Handle, text: *mut u16, capacity: i32) -> i32;
+    fn IsWindowUnicode(hwnd: Handle) -> i32;
+    fn GetGUIThreadInfo(thread: u32, info: *mut GuiThreadInfo) -> i32;
+    fn GetClipboardSequenceNumber() -> u32;
     fn WindowFromPoint(point: Point) -> Handle;
     fn GetCursorPos(point: *mut Point) -> i32;
     fn GetDpiForWindow(hwnd: Handle) -> u32;
@@ -506,13 +534,14 @@ pub fn run_self_test() -> Result<serde_json::Value, String> {
                 return Err("Windows OCR included text outside the freeform selection.".into());
             }
             let selection = diagnostic_selection()?;
+            let legacy_selection = diagnostic_legacy_selection()?;
             if selection != "Transpose" {
                 return Err(format!(
                     "UI Automation selection fixture returned {selection:?}."
                 ));
             }
             Ok(
-                serde_json::json!({"screenCapture":capture,"ocrLanguages":languages,"ocr":true,"freeformFilter":true,"selection":true,"networkRequests":0}),
+                serde_json::json!({"screenCapture":capture,"ocrLanguages":languages,"ocr":true,"freeformFilter":true,"selection":true,"legacySelection":legacy_selection,"networkRequests":0}),
             )
         })();
         RoUninitialize();
@@ -775,6 +804,181 @@ $window.ShowDialog() | Out-Null
     let _ = fixture.wait();
     let _ = reader.join();
     result.map_err(|error| format!("Windows UI Automation selection fixture failed: {error}"))
+}
+
+unsafe fn diagnostic_legacy_selection() -> Result<serde_json::Value, String> {
+    use std::{
+        io::{BufRead, BufReader, Read},
+        os::windows::process::CommandExt,
+        process::{Command, Stdio},
+    };
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+trap { [Console]::Error.WriteLine($_.Exception.Message); exit 2 }
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+Add-Type -AssemblyName System.Windows.Forms
+$form = [System.Windows.Forms.Form]::new()
+$form.Text = 'Transpose legacy selection fixture'
+$form.Width = 460
+$form.Height = 340
+$form.Left = 40
+$form.Top = 40
+$form.TopMost = $true
+$edit = [System.Windows.Forms.TextBox]::new()
+$edit.Multiline = $true
+$edit.HideSelection = $false
+$edit.SetBounds(12,12,410,70)
+$edit.Text = "First line`r`n$([char]::ConvertFromUtf32(0x1F3B9)) Transpose"
+$rich = [System.Windows.Forms.RichTextBox]::new()
+$rich.HideSelection = $false
+$rich.SetBounds(12,95,410,80)
+$rich.Text = "First line`n$([char]::ConvertFromUtf32(0x1F3B9)) Transpose"
+$password = [System.Windows.Forms.TextBox]::new()
+$password.SetBounds(12,190,410,30)
+$password.UseSystemPasswordChar = $true
+$password.Text = 'Transpose private fixture'
+$form.Controls.AddRange(@($edit,$rich,$password))
+$form.Add_Shown({
+    $edit.Select($edit.Text.IndexOf('Transpose'),9)
+    $rich.Select($rich.Text.IndexOf('Transpose'),9)
+    $password.Select(0,9)
+    $edit.Focus() | Out-Null
+    [Console]::Out.WriteLine(('{0},{1},{2},{3}' -f $form.Handle.ToInt64(),$edit.Handle.ToInt64(),$rich.Handle.ToInt64(),$password.Handle.ToInt64()))
+    [Console]::Out.Flush()
+})
+$timer = [System.Windows.Forms.Timer]::new()
+$timer.Interval = 10000
+$timer.Add_Tick({ $form.Close() })
+$timer.Start()
+$form.ShowDialog() | Out-Null
+"#;
+    let powershell = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| "C:\\Windows".into())
+        .join("System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+    let mut fixture = Command::new(powershell)
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-STA",
+            "-Command",
+            script,
+        ])
+        .creation_flags(0x08000000)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("Cannot start the legacy selection fixture: {error}"))?;
+    let Some(stdout) = fixture.stdout.take() else {
+        let _ = fixture.kill();
+        let _ = fixture.wait();
+        return Err("The legacy fixture has no output stream.".into());
+    };
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let reader = thread::spawn(move || {
+        let mut line = String::new();
+        let result = BufReader::new(stdout).read_line(&mut line).map(|_| {
+            line.trim()
+                .split(',')
+                .filter_map(|part| part.parse::<Handle>().ok())
+                .collect::<Vec<_>>()
+        });
+        let _ = ready_tx.send(result);
+    });
+    let handles = ready_rx
+        .recv_timeout(Duration::from_secs(10))
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    let result = if handles.len() != 4 {
+        let _ = fixture.kill();
+        let _ = fixture.wait();
+        let mut error = String::new();
+        if let Some(mut stderr) = fixture.stderr.take() {
+            let _ = stderr.read_to_string(&mut error);
+        }
+        Err(format!(
+            "The legacy selection fixture did not expose its controls: {}",
+            error.trim()
+        ))
+    } else {
+        (|| -> Result<serde_json::Value, String> {
+            let parent = handles[0];
+            let automation: IUIAutomation =
+                CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
+                    .map_err(|error| error.to_string())?;
+            let clipboard = GetClipboardSequenceNumber();
+            for (index, name) in [(1, "EDIT"), (2, "RichEdit")] {
+                let element = automation
+                    .ElementFromHandle(HWND(handles[index] as *mut c_void))
+                    .map_err(|error| format!("find legacy {name}: {error}"))?;
+                SetForegroundWindow(parent);
+                element
+                    .SetFocus()
+                    .map_err(|error| format!("focus legacy {name}: {error}"))?;
+                let direct = read_legacy_edit_selection(
+                    handles[index],
+                    parent,
+                    Instant::now() + Duration::from_millis(650),
+                )
+                .ok_or_else(|| format!("The native {name} selection reader returned no text."))?;
+                if direct != "Transpose" {
+                    return Err(format!(
+                        "The native {name} selection had wrong CRLF/UTF-16 offsets: {direct:?}"
+                    ));
+                }
+                let request = ReadRequest {
+                    anchor: (80, 80),
+                    foreground: parent,
+                    generation: 0,
+                };
+                let production = read_selection(&automation, &request).ok_or_else(|| {
+                    format!("The production reader missed the legacy {name} selection.")
+                })?;
+                if production.0 != "Transpose" {
+                    return Err(format!(
+                        "The production {name} reader returned the wrong selected text."
+                    ));
+                }
+            }
+            let password = automation
+                .ElementFromHandle(HWND(handles[3] as *mut c_void))
+                .map_err(|error| error.to_string())?;
+            password
+                .SetFocus()
+                .map_err(|error| format!("focus password fixture: {error}"))?;
+            let request = ReadRequest {
+                anchor: (80, 250),
+                foreground: parent,
+                generation: 0,
+            };
+            if read_legacy_edit_selection(
+                handles[3],
+                parent,
+                Instant::now() + Duration::from_millis(650),
+            )
+            .is_some()
+                || read_selection(&automation, &request).is_some()
+            {
+                return Err("A password field exposed selected text to the reader.".into());
+            }
+            if GetClipboardSequenceNumber() != clipboard {
+                return Err("Reading the native selections changed the clipboard.".into());
+            }
+            Ok(
+                serde_json::json!({"edit":true,"richEdit":true,"utf16AndParagraphOffsets":true,"passwordProtected":true,"clipboardUnchanged":true}),
+            )
+        })()
+    };
+    if let Some(parent) = handles.first() {
+        PostMessageW(*parent, 0x10, 0, 0);
+    }
+    let _ = fixture.kill();
+    let _ = fixture.wait();
+    let _ = reader.join();
+    result.map_err(|error| format!("Windows legacy selection fixture failed: {error}"))
 }
 
 unsafe extern "system" fn mouse_hook(code: i32, wparam: usize, lparam: isize) -> isize {
@@ -1067,6 +1271,10 @@ fn selection_worker(requests: mpsc::Receiver<ReadRequest>) {
         let automation: Result<IUIAutomation, _> =
             CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER);
         if let Ok(automation) = automation {
+            if let Ok(settings) = automation.cast::<IUIAutomation2>() {
+                let _ = settings.SetConnectionTimeout(150);
+                let _ = settings.SetTransactionTimeout(350);
+            }
             while let Ok(mut request) = requests.recv() {
                 while let Ok(newer) = requests.try_recv() {
                     request = newer;
@@ -1076,7 +1284,17 @@ fn selection_worker(requests: mpsc::Receiver<ReadRequest>) {
                 {
                     continue;
                 }
-                if let Some((text, app)) = read_selection(&automation, &request) {
+                let mut content = read_selection(&automation, &request);
+                if content.is_none()
+                    && request.generation == GENERATION.load(Ordering::Acquire)
+                    && GetForegroundWindow() == request.foreground
+                {
+                    thread::sleep(Duration::from_millis(100));
+                    if request.generation == GENERATION.load(Ordering::Acquire) {
+                        content = read_selection(&automation, &request);
+                    }
+                }
+                if let Some((text, app)) = content {
                     let selection = Box::new(Selection {
                         text,
                         app,
@@ -1098,77 +1316,410 @@ unsafe fn read_selection(
     automation: &IUIAutomation,
     request: &ReadRequest,
 ) -> Option<(String, String)> {
-    if !foreign_window(request.foreground) {
+    if !foreign_window(request.foreground) || GetForegroundWindow() != request.foreground {
         return None;
     }
-    let focused = automation.GetFocusedElement().ok()?;
-    let mut expected_pid = 0;
-    GetWindowThreadProcessId(request.foreground, &mut expected_pid);
-    if focused.CurrentProcessId().ok()? != expected_pid as i32 {
-        return None;
-    }
-    let walker = automation.ControlViewWalker().ok()?;
-    let mut candidates: Vec<IUIAutomationElement> = Vec::new();
-    let mut current = Some(focused);
-    for _ in 0..5 {
-        let Some(element) = current else {
-            break;
-        };
-        if element
-            .CurrentIsPassword()
-            .map(|v| v.as_bool())
-            .unwrap_or(true)
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(650);
+    let foreground_root = GetAncestor(request.foreground, 2);
+    let mut native_candidates = Vec::new();
+    let mut gui: GuiThreadInfo = zeroed();
+    gui.size = size_of::<GuiThreadInfo>() as u32;
+    if GetGUIThreadInfo(0, &mut gui) != 0 && window_belongs_to(gui.focus, foreground_root) {
+        let mut class = [0u16; 128];
+        let length = GetClassNameW(gui.focus, class.as_mut_ptr(), class.len() as i32);
+        if legacy_edit_kind(&String::from_utf16_lossy(&class[..length.max(0) as usize])).is_some()
+            && (GetWindowLongPtrW(gui.focus, -16) & 0x20 != 0
+                || bounded_message(gui.focus, 0xd2, 0, 0, deadline).is_none_or(|value| value != 0))
         {
             return None;
         }
-        current = walker.GetParentElement(&element).ok();
-        candidates.push(element);
+        native_candidates.push(gui.focus);
     }
-    if let Ok(point_element) = automation.ElementFromPoint(POINT {
+    let pointed_window = WindowFromPoint(Point {
         x: request.anchor.0,
         y: request.anchor.1,
-    }) {
-        if point_element.CurrentProcessId().ok() == Some(expected_pid as i32)
-            && !point_element.CurrentIsPassword().ok()?.as_bool()
-        {
-            candidates.push(point_element);
-        }
+    });
+    if window_belongs_to(pointed_window, foreground_root) {
+        native_candidates.push(pointed_window);
     }
-    for element in candidates {
-        let Ok(pattern) =
-            element.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
-        else {
-            continue;
-        };
-        let Ok(ranges) = pattern.GetSelection() else {
-            continue;
-        };
-        let count = ranges.Length().ok()?.min(8);
-        let mut parts = Vec::new();
-        for index in 0..count {
-            if let Ok(range) = ranges.GetElement(index) {
-                if let Ok(text) = range.GetText(16_001) {
-                    let text = text.to_string().trim().to_owned();
-                    if !text.is_empty() {
-                        parts.push(text);
+
+    let mut candidates = Vec::new();
+    let mut search_roots = Vec::new();
+    if let Ok(walker) = automation.ControlViewWalker() {
+        // A packaged app may put its focused content in a different process
+        // from the foreground ApplicationFrameWindow. Verify its ancestor
+        // window instead of requiring identical foreground/content PIDs.
+        for seed in [
+            automation.GetFocusedElement().ok(),
+            automation
+                .ElementFromPoint(POINT {
+                    x: request.anchor.0,
+                    y: request.anchor.1,
+                })
+                .ok(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            match safe_element_chain(automation, &walker, seed, foreground_root, deadline) {
+                ElementChain::Protected => return None,
+                ElementChain::Safe(chain) => {
+                    if let Some(first) = chain.first() {
+                        search_roots.push(first.clone());
+                    }
+                    for element in chain {
+                        add_element(automation, &mut candidates, element);
+                    }
+                }
+                ElementChain::Unrelated => {}
+            }
+        }
+        // TextChild identifies a text container without treating its entire
+        // child range or caret as selected text.
+        let initial = candidates.clone();
+        for element in initial {
+            if Instant::now() >= deadline {
+                break;
+            }
+            if let Ok(child) =
+                element.GetCurrentPatternAs::<IUIAutomationTextChildPattern>(UIA_TextChildPatternId)
+            {
+                if let Ok(container) = child.TextContainer() {
+                    if let ElementChain::Safe(chain) = safe_element_chain(
+                        automation,
+                        &walker,
+                        container,
+                        foreground_root,
+                        deadline,
+                    ) {
+                        for element in chain {
+                            add_element(automation, &mut candidates, element);
+                        }
                     }
                 }
             }
         }
-        let text = parts.join("\n");
-        if !text.is_empty()
-            && text.chars().count() <= 16_000
-            && GetForegroundWindow() == request.foreground
-        {
-            let mut title = [0u16; 512];
-            let count = GetWindowTextW(request.foreground, title.as_mut_ptr(), title.len() as i32);
-            return Some((
-                text,
-                String::from_utf16_lossy(&title[..count.max(0) as usize]),
-            ));
+        for element in &candidates {
+            if Instant::now() >= deadline {
+                break;
+            }
+            if let Ok(handle) = element.CurrentNativeWindowHandle() {
+                let handle = handle.0 as Handle;
+                if window_belongs_to(handle, foreground_root) {
+                    native_candidates.push(handle);
+                }
+            }
+            if let Some(text) = selected_pattern_text(element) {
+                if GetForegroundWindow() == request.foreground {
+                    return Some((text, window_title(request.foreground)));
+                }
+                return None;
+            }
+        }
+        // Some note editors focus a container while exposing the selected
+        // rich text through one of its children. Search only these small
+        // focused/pointed subtrees, never the whole app or desktop.
+        let mut queue = search_roots
+            .into_iter()
+            .map(|element| (element, 0))
+            .collect::<Vec<_>>();
+        let mut visited = 0;
+        while let Some((element, depth)) = queue.pop() {
+            if visited >= 24 || Instant::now() >= deadline {
+                break;
+            }
+            if depth >= 3 {
+                continue;
+            }
+            let mut child = walker.GetFirstChildElement(&element).ok();
+            while let Some(element) = child {
+                if visited >= 24 || Instant::now() >= deadline {
+                    break;
+                }
+                visited += 1;
+                child = walker.GetNextSiblingElement(&element).ok();
+                if let ElementChain::Safe(_) = safe_element_chain(
+                    automation,
+                    &walker,
+                    element.clone(),
+                    foreground_root,
+                    deadline,
+                ) {
+                    if let Some(text) = selected_pattern_text(&element) {
+                        if GetForegroundWindow() == request.foreground {
+                            return Some((text, window_title(request.foreground)));
+                        }
+                        return None;
+                    }
+                    queue.push((element, depth + 1));
+                }
+            }
+        }
+    }
+    native_candidates.sort_unstable();
+    native_candidates.dedup();
+    for handle in native_candidates.into_iter().take(8) {
+        if Instant::now() >= deadline {
+            break;
+        }
+        if let Some(text) = read_legacy_edit_selection(handle, request.foreground, deadline) {
+            return Some((text, window_title(request.foreground)));
         }
     }
     None
+}
+
+enum ElementChain {
+    Safe(Vec<IUIAutomationElement>),
+    Protected,
+    Unrelated,
+}
+unsafe fn safe_element_chain(
+    automation: &IUIAutomation,
+    walker: &IUIAutomationTreeWalker,
+    seed: IUIAutomationElement,
+    foreground_root: Handle,
+    deadline: Instant,
+) -> ElementChain {
+    let root = automation
+        .ElementFromHandle(HWND(foreground_root as *mut c_void))
+        .ok();
+    let mut chain = Vec::new();
+    let mut current = Some(seed);
+    let mut belongs = false;
+    let mut protected = false;
+    let mut uncertain = false;
+    for _ in 0..10 {
+        if Instant::now() >= deadline {
+            return ElementChain::Unrelated;
+        }
+        let Some(element) = current else {
+            break;
+        };
+        match element.CurrentIsPassword() {
+            Ok(value) => protected |= value.as_bool(),
+            Err(_) => uncertain = true,
+        }
+        if let Ok(handle) = element.CurrentNativeWindowHandle() {
+            belongs |= window_belongs_to(handle.0 as Handle, foreground_root);
+        }
+        if let Some(root) = &root {
+            belongs |= automation
+                .CompareElements(&element, root)
+                .is_ok_and(|v| v.as_bool());
+        }
+        current = walker.GetParentElement(&element).ok();
+        let at_root = element
+            .CurrentNativeWindowHandle()
+            .is_ok_and(|handle| handle.0 as Handle == foreground_root);
+        chain.push(element);
+        if at_root {
+            break;
+        }
+    }
+    if !belongs {
+        ElementChain::Unrelated
+    } else if protected {
+        ElementChain::Protected
+    } else if uncertain {
+        ElementChain::Unrelated
+    } else {
+        ElementChain::Safe(chain)
+    }
+}
+unsafe fn add_element(
+    automation: &IUIAutomation,
+    elements: &mut Vec<IUIAutomationElement>,
+    element: IUIAutomationElement,
+) {
+    if elements.len() < 32
+        && !elements.iter().any(|existing| {
+            automation
+                .CompareElements(existing, &element)
+                .is_ok_and(|v| v.as_bool())
+        })
+    {
+        elements.push(element);
+    }
+}
+unsafe fn selected_pattern_text(element: &IUIAutomationElement) -> Option<String> {
+    if element.CurrentIsPassword().ok()?.as_bool() {
+        return None;
+    }
+    let pattern = element
+        .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+        .ok()
+        .or_else(|| {
+            element
+                .GetCurrentPatternAs::<IUIAutomationTextPattern2>(UIA_TextPattern2Id)
+                .ok()
+                .map(Into::into)
+        })?;
+    let ranges = pattern.GetSelection().ok()?;
+    let count = ranges.Length().ok()?;
+    if !(1..=8).contains(&count) {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for index in 0..count {
+        let text = ranges
+            .GetElement(index)
+            .and_then(|range| range.GetText(32_001))
+            .ok()?
+            .to_string();
+        if text.encode_utf16().count() >= 32_001 {
+            return None;
+        }
+        if !text.trim().is_empty() {
+            parts.push(text);
+        }
+    }
+    clean_selection(parts.join("\n"))
+}
+fn clean_selection(text: String) -> Option<String> {
+    if text.chars().count() > 16_000 {
+        return None;
+    }
+    let text = text.trim();
+    if text.is_empty() || text.chars().count() > 16_000 || text.chars().all(char::is_control) {
+        None
+    } else {
+        Some(text.to_owned())
+    }
+}
+unsafe fn window_title(window: Handle) -> String {
+    let mut title = [0u16; 512];
+    let count = GetWindowTextW(window, title.as_mut_ptr(), title.len() as i32);
+    String::from_utf16_lossy(&title[..count.max(0) as usize])
+}
+unsafe fn window_belongs_to(window: Handle, foreground_root: Handle) -> bool {
+    window != 0
+        && foreground_root != 0
+        && (window == foreground_root || GetAncestor(window, 2) == foreground_root)
+}
+fn legacy_edit_kind(class: &str) -> Option<bool> {
+    let class = class.to_ascii_lowercase();
+    if class == "edit" || class.starts_with("windowsforms10.edit.") {
+        Some(false)
+    } else if class.starts_with("richedit") || class.starts_with("windowsforms10.richedit") {
+        Some(true)
+    } else {
+        None
+    }
+}
+unsafe fn bounded_message(
+    window: Handle,
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+    deadline: Instant,
+) -> Option<usize> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())?
+        .as_millis()
+        .min(100) as u32;
+    if remaining == 0 {
+        return None;
+    }
+    let mut result = 0;
+    (SendMessageTimeoutW(
+        window,
+        message,
+        wparam,
+        lparam,
+        0x23,
+        remaining,
+        &mut result,
+    ) != 0)
+        .then_some(result)
+}
+unsafe fn read_legacy_edit_selection(
+    window: Handle,
+    foreground: Handle,
+    deadline: Instant,
+) -> Option<String> {
+    if GetForegroundWindow() != foreground
+        || !window_belongs_to(window, GetAncestor(foreground, 2))
+        || IsWindowUnicode(window) == 0
+    {
+        return None;
+    }
+    let mut class = [0u16; 128];
+    let length = GetClassNameW(window, class.as_mut_ptr(), class.len() as i32);
+    let rich = legacy_edit_kind(&String::from_utf16_lossy(&class[..length.max(0) as usize]))?;
+    // Only the actual Windows EDIT/RichEdit controls have this fallback. Never
+    // issue WM_COPY, keyboard shortcuts or read password controls.
+    if GetWindowLongPtrW(window, -16) & 0x20 != 0 {
+        return None;
+    } // ES_PASSWORD
+    if bounded_message(window, 0xd2, 0, 0, deadline)? != 0 {
+        return None;
+    } // EM_GETPASSWORDCHAR
+    let mut pid = 0;
+    GetWindowThreadProcessId(window, &mut pid);
+    let send = |message, wparam, lparam| {
+        (GetForegroundWindow() == foreground
+            && window_belongs_to(window, GetAncestor(foreground, 2)))
+        .then(|| bounded_message(window, message, wparam, lparam, deadline))
+        .flatten()
+    };
+    let (mut start, mut end) = (0u32, 0u32);
+    send(
+        0xb0,
+        (&mut start as *mut u32) as usize,
+        (&mut end as *mut u32) as isize,
+    )?;
+    if end <= start || end - start > 32_000 || end > 65_535 {
+        return None;
+    }
+    let length = send(0xe, 0, 0)?;
+    if length == 0 || length > 65_535 {
+        return None;
+    }
+    let mut text = vec![0u16; length + 1];
+    let copied = send(0xd, text.len(), text.as_mut_ptr() as isize)?;
+    if copied > length {
+        return None;
+    }
+    text.truncate(copied);
+    let (mut confirmed_start, mut confirmed_end) = (0u32, 0u32);
+    send(
+        0xb0,
+        (&mut confirmed_start as *mut u32) as usize,
+        (&mut confirmed_end as *mut u32) as isize,
+    )?;
+    let mut current_pid = 0;
+    GetWindowThreadProcessId(window, &mut current_pid);
+    if (start, end) != (confirmed_start, confirmed_end)
+        || pid != current_pid
+        || GetForegroundWindow() != foreground
+    {
+        return None;
+    }
+    legacy_selection_text(&text, start as usize, end as usize, rich)
+}
+fn legacy_selection_text(text: &[u16], start: usize, end: usize, rich: bool) -> Option<String> {
+    let normalized;
+    let text = if rich {
+        // RichEdit selection positions count one CR per paragraph, whereas
+        // WM_GETTEXT expands it to CRLF. Index UTF-16, including surrogate pairs.
+        normalized = text
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(index, ch)| {
+                (!(ch == 10 && index > 0 && text[index - 1] == 13)).then_some(ch)
+            })
+            .collect::<Vec<_>>();
+        normalized.as_slice()
+    } else {
+        text
+    };
+    if start >= end || end > text.len() {
+        return None;
+    }
+    clean_selection(String::from_utf16(&text[start..end]).ok()?)
 }
 
 unsafe fn begin_capture() {
@@ -1730,5 +2281,57 @@ pub fn launch_at_login() -> bool {
         );
         std::env::current_exe()
             .is_ok_and(|path| command == format!("\"{}\" --background", path.to_string_lossy()))
+    }
+}
+
+#[cfg(test)]
+mod selection_compatibility_tests {
+    use super::{clean_selection, legacy_edit_kind, legacy_selection_text};
+    #[test]
+    fn native_edit_classes_are_narrow() {
+        assert_eq!(legacy_edit_kind("EDIT"), Some(false));
+        assert_eq!(legacy_edit_kind("RICHEDIT50W"), Some(true));
+        assert_eq!(
+            legacy_edit_kind("WindowsForms10.RichEdit20W.app.0.123"),
+            Some(true)
+        );
+        assert_eq!(
+            legacy_edit_kind("WindowsForms10.EDIT.app.0.123"),
+            Some(false)
+        );
+        assert_eq!(legacy_edit_kind("Chrome_RenderWidgetHostHWND"), None);
+        assert_eq!(legacy_edit_kind("PasswordWidget"), None);
+    }
+    #[test]
+    fn utf16_selection_preserves_supplementary_characters() {
+        let text = "a🎹中文z".encode_utf16().collect::<Vec<_>>();
+        assert_eq!(
+            legacy_selection_text(&text, 1, 5, false).as_deref(),
+            Some("🎹中文")
+        );
+        assert!(legacy_selection_text(&text, 2, 5, false).is_none());
+    }
+    #[test]
+    fn rich_edit_paragraph_positions_use_one_cr() {
+        let text = "First line\r\n🎹 Transpose"
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            legacy_selection_text(&text, 14, 23, true).as_deref(),
+            Some("Transpose")
+        );
+        assert_eq!(
+            legacy_selection_text(&text, 15, 24, false).as_deref(),
+            Some("Transpose")
+        );
+    }
+    #[test]
+    fn empty_oversized_and_invalid_ranges_are_rejected() {
+        let text = "small".encode_utf16().collect::<Vec<_>>();
+        assert!(legacy_selection_text(&text, 0, 0, false).is_none());
+        assert!(legacy_selection_text(&text, 1, 20, false).is_none());
+        assert!(clean_selection("a".repeat(16_001)).is_none());
+        assert!(clean_selection(format!("{}word", " ".repeat(16_001))).is_none());
+        assert!(clean_selection("\t\r\n".into()).is_none());
     }
 }

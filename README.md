@@ -14,6 +14,7 @@ A macOS menu bar translation tool. Select text to reveal one small translation b
 - Apple Translation, DeepSeek, OpenRouter, custom APIs and local CLI tools.
 - Personal glossary and AI writing preferences.
 - Settings on app launch; optional launch at login.
+- In-app update checks and signed downloads; online updates start with the next signed release.
 
 Cross-app behavior depends on macOS permissions and the source app.
 

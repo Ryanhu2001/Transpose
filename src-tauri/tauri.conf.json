@@ -52,5 +52,17 @@
       "signingIdentity": "-",
       "infoPlist": "Info.plist"
     }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDBEQzU5QzhFOTVFQUZGNkQKUldSdC8rcVZqcHpGRFNtYkVqdHV3c2RaQjFnaTdyUCt4YlFtTDNnd1RyR216NVN6bFJCZzlhUU8K",
+      "endpoints": [
+        "https://github.com/Ryanhu2001/Transpose/releases/latest/download/latest.json"
+      ],
+      "requireSignedVersion": true,
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

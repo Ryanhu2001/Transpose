@@ -57,7 +57,11 @@ cargo test --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc 
 npm run tauri -- build --target x86_64-pc-windows-msvc --bundles nsis --ci
 ```
 
-Tauri merges `src-tauri/tauri.windows.conf.json` automatically. The Windows workflow builds an unsigned NSIS installer, tests the built and installed app, and uploads checksums and diagnostic reports as CI artifacts. It does not publish a release. Separate offline platform checks cover screen capture, OCR, freeform filtering and selection. Real mouse interaction and multiple displays still need Windows acceptance testing.
+Tauri merges `src-tauri/tauri.windows.conf.json` automatically. The Windows workflow builds an unsigned NSIS installer, tests startup, real mouse dragging and resizing, screen capture, OCR and cross-process selection, then uploads the installer and reports. It does not publish a release. Real applications and multiple displays still need acceptance testing.
+
+## Signed updates
+
+Settings checks for updates and installs only after confirmation. Normal builds need no signing key. The manual **Prepare signed updates** workflow uses an existing version tag and the `TAURI_SIGNING_PRIVATE_KEY` repository secret to prepare macOS arm64, Windows x64 and `latest.json` artifacts. Attach these files to the matching release when publishing; the workflow never publishes or changes tags. Updater signatures do not replace OS code signing or notarization.
 
 ## Verification
 
