@@ -66,7 +66,7 @@ final class TranslationService {
         let session = self.session
         let task = Task { @MainActor in
             if options.provider == .apple { return try await AppleTranslationBackend.translate(input, options: options, onDelta: emit) }
-            if let request { return try await Self.translateAPI(request, session: session, onDelta: emit) }
+            if let request { return try await Self.translateAPI(request, session: session, allowMandatoryReasoningRetry: options.provider == .openrouter, onDelta: emit) }
             return try await CLIRunner.translate(input, options: options, systemPrompt: prompt, onDelta: emit)
         }
         activeTask = task
@@ -81,12 +81,24 @@ final class TranslationService {
         return TranslationStats(elapsed: Date().timeIntervalSince(start), firstToken: firstToken, cached: false, provider: options.provider.title)
     }
 
-    private static func translateAPI(_ request: URLRequest, session: URLSession, onDelta: @escaping @MainActor (String) -> Void) async throws -> String {
+    private static func translateAPI(_ request: URLRequest, session: URLSession, allowMandatoryReasoningRetry: Bool = false, onDelta: @escaping @MainActor (String) -> Void) async throws -> String {
         do {
             let (bytes, response) = try await session.bytes(for: request)
             defer { bytes.task.cancel() }
             guard let response = response as? HTTPURLResponse else { throw AppError.message("翻译服务响应无效。") }
             guard (200..<300).contains(response.statusCode) else {
+                if response.statusCode == 400, allowMandatoryReasoningRetry {
+                    var data = Data()
+                    for try await byte in bytes {
+                        try Task.checkCancellation()
+                        guard data.count < 65_536 else { data.removeAll(); break }
+                        data.append(byte)
+                    }
+                    if let retry = OpenAIRequestBuilder.mandatoryReasoningRequest(request, errorData: data) {
+                        try Task.checkCancellation()
+                        return try await translateAPI(retry, session: session, onDelta: onDelta)
+                    }
+                }
                 switch response.statusCode {
                 case 300..<400: throw AppError.message("服务地址发生重定向，请填写最终服务地址。")
                 case 401, 403: throw AppError.message("API Key 无效或没有访问权限，请检查设置。")
@@ -160,6 +172,22 @@ final class TranslationRedirectPolicy: NSObject, URLSessionTaskDelegate, @unchec
 }
 
 enum OpenAIRequestBuilder {
+    static func mandatoryReasoningRequest(_ request: URLRequest, errorData: Data) -> URLRequest? {
+        guard let error = try? JSONSerialization.jsonObject(with: errorData) as? [String: Any],
+              let detail = error["error"] as? [String: Any], let message = (detail["message"] as? String)?.lowercased(),
+              message.contains("reasoning is mandatory"), message.contains("cannot be disabled"),
+              let original = request.httpBody,
+              var body = try? JSONSerialization.jsonObject(with: original) as? [String: Any],
+              let reasoning = body["reasoning"] as? [String: Any], reasoning["enabled"] as? Bool == false else { return nil }
+        // Preserve the selected model and routing. Exclusion hides reasoning
+        // from the response while allowing models that require it to run.
+        body["reasoning"] = ["exclude": true]
+        guard let data = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+        var retry = request
+        retry.httpBody = data
+        return retry
+    }
+
     static func resolvedModel(_ options: TranslationOptions) -> String {
         let model = options.model.trimmingCharacters(in: .whitespacesAndNewlines)
         return model.isEmpty ? options.provider.defaultModel : model

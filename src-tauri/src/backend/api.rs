@@ -3,6 +3,7 @@ use serde_json::{json, Value};
 use std::{sync::OnceLock, time::Duration};
 
 const MAXIMUM_BYTES: usize = 2_000_000;
+const MAXIMUM_ERROR_BYTES: usize = 65_536;
 static CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
 
 /// Reject clear-text remote endpoints and URL credentials before resolving any
@@ -92,17 +93,21 @@ pub async fn translate(
         })
         .as_ref()
         .map_err(Clone::clone)?;
-    let mut request = client
-        .post(url)
-        .header("Accept", "text/event-stream")
-        .json(&body);
-    if !key.trim().is_empty() {
-        request = request.bearer_auth(key.trim());
+    let mut response = request(client, &url, provider, key, &body)
+        .send()
+        .await
+        .map_err(network_error)?;
+    // Some models require reasoning. Only retry an explicit rejection of our
+    // disabled-reasoning preference, preserving the user's model and routing.
+    if provider == "openrouter" && response.status().as_u16() == 400 {
+        let error = bounded_error_body(&mut response).await;
+        if let Some(retry_body) = mandatory_reasoning_body(&body, &error) {
+            response = request(client, &url, provider, key, &retry_body)
+                .send()
+                .await
+                .map_err(network_error)?;
+        }
     }
-    if provider == "openrouter" {
-        request = request.header("X-Title", "Transpose");
-    }
-    let mut response = request.send().await.map_err(network_error)?;
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
         return Err(match status {
@@ -183,6 +188,52 @@ pub async fn translate(
         return Err("The model returned no translation. Check the model name.".into());
     }
     Ok(output)
+}
+
+fn request(
+    client: &Client,
+    url: &Url,
+    provider: &str,
+    key: &str,
+    body: &Value,
+) -> reqwest::RequestBuilder {
+    let mut request = client
+        .post(url.clone())
+        .header("Accept", "text/event-stream")
+        .json(body);
+    if !key.trim().is_empty() {
+        request = request.bearer_auth(key.trim());
+    }
+    if provider == "openrouter" {
+        request = request.header("X-Title", "Transpose");
+    }
+    request
+}
+
+async fn bounded_error_body(response: &mut reqwest::Response) -> Vec<u8> {
+    let mut data = Vec::new();
+    while let Ok(Some(chunk)) = response.chunk().await {
+        if data.len() + chunk.len() > MAXIMUM_ERROR_BYTES {
+            return Vec::new();
+        }
+        data.extend_from_slice(&chunk);
+    }
+    data
+}
+
+fn mandatory_reasoning_body(original: &Value, error: &[u8]) -> Option<Value> {
+    let error: Value = serde_json::from_slice(error).ok()?;
+    let message = error["error"]["message"].as_str()?.to_ascii_lowercase();
+    if original["reasoning"]["enabled"] != false
+        || !message.contains("reasoning is mandatory")
+        || !message.contains("cannot be disabled")
+    {
+        return None;
+    }
+    let mut body = original.clone();
+    // Excluding reasoning hides it in the response; it does not disable it.
+    body["reasoning"] = json!({"exclude":true});
+    Some(body)
 }
 
 fn network_error(error: reqwest::Error) -> String {
@@ -275,6 +326,192 @@ pub fn parse_complete(data: &[u8]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
+
+    const MANDATORY_REASONING: &str = r#"{"error":{"message":"Reasoning is mandatory for this endpoint and cannot be disabled.","code":400}}"#;
+
+    fn server(responses: Vec<(u16, String)>) -> (String, thread::JoinHandle<Vec<Value>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("http://{}/v1", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, body) in responses {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            thread::sleep(Duration::from_millis(5))
+                        }
+                        other => panic!("Expected fixture request: {other:?}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut incoming = Vec::new();
+                let header_end = loop {
+                    let mut chunk = [0; 4096];
+                    let count = stream.read(&mut chunk).unwrap();
+                    assert_ne!(count, 0);
+                    incoming.extend_from_slice(&chunk[..count]);
+                    if let Some(index) = incoming.windows(4).position(|value| value == b"\r\n\r\n")
+                    {
+                        break index + 4;
+                    }
+                };
+                let headers = std::str::from_utf8(&incoming[..header_end])
+                    .unwrap()
+                    .to_ascii_lowercase();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                while incoming.len() - header_end < length {
+                    let mut chunk = [0; 4096];
+                    let count = stream.read(&mut chunk).unwrap();
+                    assert_ne!(count, 0);
+                    incoming.extend_from_slice(&chunk[..count]);
+                }
+                requests.push(
+                    serde_json::from_slice(&incoming[header_end..header_end + length]).unwrap(),
+                );
+                write!(stream, "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            requests
+        });
+        (address, handle)
+    }
+
+    #[test]
+    fn reasoning_retry_only_relaxes_an_explicit_disable_rejection() {
+        let original = json!({"model":"minimax/minimax-m3.1-flash:free","reasoning":{"enabled":false},"provider":{"allow_fallbacks":false},"messages":[{"role":"user","content":"fixture"}]});
+        let retried = mandatory_reasoning_body(&original, MANDATORY_REASONING.as_bytes()).unwrap();
+        assert_eq!(retried["reasoning"], json!({"exclude":true}));
+        let mut expected = original.clone();
+        expected["reasoning"] = json!({"exclude":true});
+        assert_eq!(retried, expected);
+        assert!(mandatory_reasoning_body(&retried, MANDATORY_REASONING.as_bytes()).is_none());
+        for error in [
+            r#"{"error":{"message":"Unknown model"}}"#,
+            r#"{"error":{"message":"Unsupported parameter: reasoning"}}"#,
+            r#"{"error":{"message":"Reasoning is mandatory"}}"#,
+            "Reasoning is mandatory and cannot be disabled.",
+            "malformed",
+        ] {
+            assert!(mandatory_reasoning_body(&original, error.as_bytes()).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn mandatory_reasoning_retries_same_model_without_exposing_reasoning() {
+        let response = r#"{"choices":[{"message":{"content":"你好。","reasoning":"private fixture reasoning"},"finish_reason":"stop"}]}"#;
+        let (address, server) = server(vec![
+            (400, MANDATORY_REASONING.into()),
+            (200, response.into()),
+        ]);
+        let result = translate(
+            "openrouter",
+            &address,
+            "minimax/minimax-m3.1-flash:free",
+            "fixture-key",
+            "Translate",
+            "Hello",
+            &|value| assert_eq!(value, "你好。"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, "你好。");
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["reasoning"], json!({"enabled":false}));
+        let mut expected = requests[0].clone();
+        expected["reasoning"] = json!({"exclude":true});
+        assert_eq!(requests[1], expected);
+    }
+
+    #[tokio::test]
+    async fn invalid_models_and_non_openrouter_errors_are_never_retried() {
+        for (provider, error) in [
+            (
+                "openrouter",
+                r#"{"error":{"message":"Invalid model identifier"}}"#,
+            ),
+            ("customAPI", MANDATORY_REASONING),
+        ] {
+            let (address, server) = server(vec![(400, error.into())]);
+            let error = translate(
+                provider,
+                &address,
+                "fixture",
+                "fixture-key",
+                "Translate",
+                "Hello",
+                &|_| panic!("No failed-request delta"),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains("HTTP 400"));
+            assert!(!error.contains("Invalid model identifier"));
+            assert_eq!(server.join().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_disable_rejection_is_not_retried_again() {
+        let (address, server) = server(vec![
+            (400, MANDATORY_REASONING.into()),
+            (400, MANDATORY_REASONING.into()),
+        ]);
+        let error = translate(
+            "openrouter",
+            &address,
+            "fixture",
+            "fixture-key",
+            "Translate",
+            "Hello",
+            &|_| panic!("No failed-request delta"),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("HTTP 400"));
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn oversized_reasoning_errors_are_not_retried_or_exposed() {
+        // This remains valid JSON containing the exact retry trigger. Only the
+        // size bound should prevent a retry, rather than malformed JSON.
+        let mut error = MANDATORY_REASONING.to_owned();
+        error.push_str(&" ".repeat(MAXIMUM_ERROR_BYTES + 1));
+        let (address, server) = server(vec![(400, error)]);
+        let error = translate(
+            "openrouter",
+            &address,
+            "fixture",
+            "fixture-key",
+            "Translate",
+            "Hello",
+            &|_| panic!("No failed-request delta"),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("HTTP 400"));
+        assert!(!error.contains("Reasoning is mandatory"));
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
     #[test]
     fn endpoints_refuse_unencrypted_remote_and_credentials() {
         assert!(endpoint("customAPI", "http://example.com/v1").is_err());

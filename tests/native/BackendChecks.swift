@@ -1,29 +1,59 @@
 import Foundation
 
 private final class BackendMockProtocol: URLProtocol, @unchecked Sendable {
-    enum Fixture { case stream, truncated, hang, redirect }
+    enum Fixture { case stream, truncated, hang, redirect, mandatoryReasoning, mandatoryAlways, invalidModel, oversizedError }
+    static let mandatoryReasoning = #"{"error":{"message":"Reasoning is mandatory for this endpoint and cannot be disabled.","code":400}}"#
     private static let lock = NSLock()
     private static var fixture: Fixture = .stream
     private static var requests: [URLRequest] = []
     private static var stopped: Set<Int> = []
+    private static var requestBodies: [[String: Any]] = []
     private var number = -1
 
     static func reset(_ value: Fixture) {
-        lock.lock(); fixture = value; requests = []; stopped = []; lock.unlock()
+        lock.lock(); fixture = value; requests = []; stopped = []; requestBodies = []; lock.unlock()
     }
     static var count: Int { lock.lock(); defer { lock.unlock() }; return requests.count }
     static var hosts: [String] { lock.lock(); defer { lock.unlock() }; return requests.compactMap { $0.url?.host } }
+    static var bodies: [[String: Any]] { lock.lock(); defer { lock.unlock() }; return requestBodies }
     static func didStop(_ number: Int) -> Bool { lock.lock(); defer { lock.unlock() }; return stopped.contains(number) }
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
+        var data = request.httpBody
+        if data == nil, let stream = request.httpBodyStream {
+            stream.open(); defer { stream.close() }
+            var captured = Data()
+            var buffer = [UInt8](repeating: 0, count: 4096)
+            while stream.hasBytesAvailable {
+                let count = stream.read(&buffer, maxLength: buffer.count)
+                if count <= 0 { break }
+                captured.append(buffer, count: count)
+            }
+            data = captured
+        }
         Self.lock.lock()
         number = Self.requests.count
         Self.requests.append(request)
+        Self.requestBodies.append(data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:])
         let fixture = Self.fixture
         Self.lock.unlock()
         let url = request.url!
+        let error: String?
+        switch fixture {
+        case .mandatoryReasoning where number == 0, .mandatoryAlways: error = Self.mandatoryReasoning
+        case .invalidModel: error = #"{"error":{"message":"Invalid model identifier"}}"#
+        case .oversizedError: error = Self.mandatoryReasoning + String(repeating: " ", count: 65_537)
+        default: error = nil
+        }
+        if let error {
+            let response = HTTPURLResponse(url: url, statusCode: 400, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: Data(error.utf8))
+            client?.urlProtocolDidFinishLoading(self)
+            return
+        }
         if case .redirect = fixture, url.host != "redirect-target.test" {
             let response = HTTPURLResponse(url: url, statusCode: 302, httpVersion: "HTTP/1.1", headerFields: ["Location": "https://redirect-target.test/v1/chat/completions"])!
             client?.urlProtocol(self, wasRedirectedTo: URLRequest(url: URL(string: "https://redirect-target.test/v1/chat/completions")!), redirectResponse: response)
@@ -79,6 +109,15 @@ func runBackendChecks() async throws -> Int {
     let paid = try OpenAIRequestBuilder.request(text: "Hello", options: options(provider: .openrouter, model: "explicit/user-model"), prompt: "Translate", apiKey: "fixture-not-a-real-key")
     let paidBody = try JSONSerialization.jsonObject(with: paid.httpBody!) as! [String: Any]
     try check(paidBody["model"] as? String == "explicit/user-model", "explicit user model is preserved")
+    let reasoningRetry = OpenAIRequestBuilder.mandatoryReasoningRequest(paid, errorData: Data(BackendMockProtocol.mandatoryReasoning.utf8))!
+    var expectedRetry = paidBody
+    expectedRetry["reasoning"] = ["exclude": true]
+    let retryBody = try JSONSerialization.jsonObject(with: reasoningRetry.httpBody!) as! NSDictionary
+    try check(retryBody.isEqual(to: expectedRetry) && reasoningRetry.url == paid.url && reasoningRetry.allHTTPHeaderFields == paid.allHTTPHeaderFields, "mandatory reasoning changes only reasoning options")
+    try check(OpenAIRequestBuilder.mandatoryReasoningRequest(reasoningRetry, errorData: Data(BackendMockProtocol.mandatoryReasoning.utf8)) == nil, "mandatory reasoning cannot retry an already relaxed request")
+    for error in [#"{"error":{"message":"Unknown model"}}"#, #"{"error":{"message":"Unsupported parameter: reasoning"}}"#, #"{"error":{"message":"Reasoning is mandatory"}}"#, "Reasoning is mandatory and cannot be disabled.", "malformed"] {
+        try check(OpenAIRequestBuilder.mandatoryReasoningRequest(paid, errorData: Data(error.utf8)) == nil, "unrelated or unstructured error is never retried")
+    }
     let noKey = try OpenAIRequestBuilder.request(text: "Hello", options: options(base: "http://localhost:11434/v1", key: ""), prompt: "Translate", apiKey: "")
     try check(noKey.value(forHTTPHeaderField: "Authorization") == nil, "local service without API key")
 
@@ -130,6 +169,24 @@ func runBackendChecks() async throws -> Int {
     ]
     for variant in changed { _ = try await service.translate("Hello world", options: variant) { _ in } }
     try check(BackendMockProtocol.count == 8, "cache isolates endpoint model provider target preferences glossary and credential")
+
+    BackendMockProtocol.reset(.mandatoryReasoning)
+    var reasoningDeltas: [String] = []
+    _ = try await service.translate("Mandatory reasoning fixture", options: options(provider: .openrouter, model: "minimax/minimax-m3.1-flash:free")) { reasoningDeltas.append($0) }
+    let reasoningBodies = BackendMockProtocol.bodies
+    var expectedSecond = reasoningBodies[0]
+    expectedSecond["reasoning"] = ["exclude": true]
+    try check(BackendMockProtocol.count == 2 && (reasoningBodies[1] as NSDictionary).isEqual(to: expectedSecond) && reasoningDeltas.last == "你好，世界。", "HTTP 400 mandatory reasoning retries the same model once")
+
+    for (fixture, provider, label) in [(BackendMockProtocol.Fixture.invalidModel, TranslationProvider.openrouter, "invalid model"), (.mandatoryAlways, .openrouter, "repeated mandatory error"), (.mandatoryAlways, .customAPI, "non OpenRouter request"), (.oversizedError, .openrouter, "oversized error body")] {
+        BackendMockProtocol.reset(fixture)
+        var rejected = false
+        do { _ = try await service.translate(label, options: options(provider: provider)) { _ in } }
+        catch let error as AppError { rejected = error.localizedDescription.contains("400") && !error.localizedDescription.contains("Invalid model identifier") }
+        let expectedCount: Int
+        if case .mandatoryAlways = fixture, provider == .openrouter { expectedCount = 2 } else { expectedCount = 1 }
+        try check(rejected && BackendMockProtocol.count == expectedCount, "HTTP error remains sanitized without an extra retry: " + label)
+    }
 
     BackendMockProtocol.reset(.truncated)
     var failures = 0
