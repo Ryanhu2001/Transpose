@@ -1,7 +1,10 @@
 //! Windows host: keep credentials/settings in the backend and restrict the result webview.
 use crate::{backend::Backend, platform::windows as platform};
 use serde_json::{json, Value};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex, OnceLock,
+};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -11,6 +14,11 @@ use tauri::{
 static BACKEND: OnceLock<Arc<Backend>> = OnceLock::new();
 static ANCHOR: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 static LAST_RESULT: Mutex<Option<String>> = Mutex::new(None);
+static RESULT_TEST_READY: AtomicBool = AtomicBool::new(false);
+
+fn result_test_enabled() -> bool {
+    std::env::args().any(|arg| arg == "--windows-result-test")
+}
 
 fn backend() -> Result<&'static Arc<Backend>, String> {
     BACKEND
@@ -19,7 +27,8 @@ fn backend() -> Result<&'static Arc<Backend>, String> {
 }
 
 pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    let smoke = std::env::args().any(|arg| arg == "--smoke-test");
+    let result_test = result_test_enabled();
+    let smoke = result_test || std::env::args().any(|arg| arg == "--smoke-test");
     let data_dir = if smoke {
         std::env::temp_dir().join(format!("transpose-smoke-{}", std::process::id()))
     } else {
@@ -43,6 +52,21 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .skip_taskbar(true)
         .focused(false)
         .visible(false)
+        .on_page_load(move |window, payload| {
+            if result_test && payload.event() == tauri::webview::PageLoadEvent::Finished {
+                let _ = window.eval(r#"
+                    (async () => {
+                        for (let i = 0; i < 150; i++) {
+                            if (document.querySelector('.translation-output')?.textContent === 'The translation window stays under your control.') {
+                                await window.__TAURI_INTERNALS__.invoke('native_request', {action:'result_test_ready',payload:{}});
+                                return;
+                            }
+                            await new Promise(resolve => setTimeout(resolve, 100));
+                        }
+                    })();
+                "#);
+            }
+        })
         .on_navigation(|url| {
             matches!(
                 url.host_str(),
@@ -50,7 +74,7 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             )
         })
         .build()?;
-    if smoke {
+    if smoke && !result_test {
         state.set_platform_status(true, false);
         return Ok(());
     }
@@ -61,6 +85,9 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let recognize_state = state.clone();
     platform::start(platform::Callbacks {
         on_translate: Arc::new(move |text, source, point| {
+            if result_test {
+                return;
+            }
             set_anchor(point);
             let state = translate_state.clone();
             tauri::async_runtime::spawn(async move {
@@ -78,17 +105,29 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             }
         }),
         on_error: Arc::new(move |error| {
+            if result_test {
+                return;
+            }
             let state = error_state.clone();
             tauri::async_runtime::spawn(async move {
                 state.show_error(error);
             });
         }),
         on_recognizing: Arc::new(move |point| {
+            if result_test {
+                return;
+            }
             set_anchor(point);
             recognize_state.show_recognizing();
         }),
     })
     .map_err(std::io::Error::other)?;
+    if result_test {
+        state.set_platform_status(true, false);
+        set_anchor((120, 120));
+        state.prepare_result_test().map_err(std::io::Error::other)?;
+        return Ok(());
+    }
     platform::set_automatic_selection(state.automatic_selection());
     state.set_platform_status(
         !platform::ocr_languages().is_empty(),
@@ -132,6 +171,48 @@ fn emit_event(app: &AppHandle, event: Value) {
     }
     let _ = app.emit_to("settings", "native:event", event.clone());
     let _ = app.emit_to("result", "native:event", event);
+    write_result_test_report(app);
+}
+
+fn write_result_test_report(app: &AppHandle) {
+    if !result_test_enabled() {
+        return;
+    }
+    let args: Vec<_> = std::env::args_os().collect();
+    let Some(path) = args
+        .iter()
+        .position(|arg| arg == "--diagnostics-output")
+        .and_then(|index| args.get(index + 1))
+        .map(std::path::PathBuf::from)
+    else {
+        return;
+    };
+    let Some(window) = app.get_webview_window("result") else {
+        return;
+    };
+    let Ok(backend) = backend() else {
+        return;
+    };
+    let position = window.outer_position().unwrap_or_default();
+    let size = window.outer_size().unwrap_or_default();
+    let report = json!({
+        "ready": RESULT_TEST_READY.load(Ordering::Acquire),
+        "fixtureText": "The translation window stays under your control.",
+        "networkRequests": 0,
+        "window": {
+            "hwnd": window.hwnd().map(|handle| (handle.0 as usize).to_string()).unwrap_or_default(),
+            "left": position.x, "top": position.y,
+            "right": position.x + size.width as i32,
+            "bottom": position.y + size.height as i32,
+            "dpi": window.scale_factor().unwrap_or(1.0) * 96.0,
+            "minWidth":360,"minHeight":180
+        },
+        "result":backend.state()["result"]
+    });
+    let temporary = path.with_extension("tmp");
+    if std::fs::write(&temporary, report.to_string()).is_ok() {
+        let _ = std::fs::rename(temporary, path);
+    }
 }
 
 fn place_result(window: &WebviewWindow) {
@@ -177,6 +258,10 @@ pub async fn request(
     let state = backend()?;
     let app = window.app_handle();
     match action {
+        "result_test_ready" => {
+            RESULT_TEST_READY.store(true, Ordering::Release);
+            write_result_test_report(app);
+        }
         "capture" => {
             if let Some(result) = app.get_webview_window("result") {
                 let _ = result.hide();
@@ -252,6 +337,7 @@ fn window_allowed(label: &str, action: &str) -> bool {
                     | "result_copy"
                     | "open_settings"
             ))
+        || (label == "result" && result_test_enabled() && action == "result_test_ready")
 }
 
 fn open_external(url: &str) -> Result<(), String> {

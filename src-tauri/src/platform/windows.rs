@@ -47,6 +47,7 @@ const CLEAR_OUTLINE: u32 = 0x8002;
 const SELECTED: u32 = 0x8003;
 const INPUT: u32 = 0x8004;
 const STOP: u32 = 0x8005;
+const OWN_INPUT: u32 = 0x8006;
 const SELECTION_TIMER: usize = 1;
 const LAUNCHER_TIMER: usize = 2;
 const HOTKEY_ID: i32 = 0x5452;
@@ -227,6 +228,7 @@ unsafe extern "system" {
     fn SetForegroundWindow(hwnd: Handle) -> i32;
     fn GetForegroundWindow() -> Handle;
     fn GetWindowThreadProcessId(hwnd: Handle, pid: *mut u32) -> u32;
+    fn GetAncestor(hwnd: Handle, flags: u32) -> Handle;
     fn GetWindowTextW(hwnd: Handle, text: *mut u16, capacity: i32) -> i32;
     fn WindowFromPoint(point: Point) -> Handle;
     fn GetCursorPos(point: *mut Point) -> i32;
@@ -779,8 +781,14 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: usize, lparam: isize) ->
     if code >= 0 && (wparam == 0x201 || wparam == 0x202) && !CAPTURE_ACTIVE.load(Ordering::Relaxed)
     {
         let event = &*(lparam as *const MouseInput);
-        let point = pack_point(event.point);
-        let _ = post(INPUT, wparam, point);
+        // WebView2 can put a renderer-process child HWND under our result.
+        // Classify its top-level window now, before queued input can outlive a
+        // native move or a hide, rather than checking WindowFromPoint later.
+        if foreign_window(WindowFromPoint(event.point)) {
+            let _ = post(INPUT, wparam, pack_point(event.point));
+        } else if wparam == 0x201 {
+            let _ = post(OWN_INPUT, wparam, 0);
+        }
     }
     CallNextHookEx(0, code, wparam, lparam)
 }
@@ -794,7 +802,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: usize, lparam: isize)
         let selection_key = GetAsyncKeyState(0x10) < 0
             && [0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28].contains(&event.vk)
             || event.vk == b'A' as u32 && GetAsyncKeyState(0x11) < 0;
-        if selection_key {
+        if selection_key && foreign_window(GetForegroundWindow()) {
             let mut point = Point::default();
             GetCursorPos(&mut point);
             let _ = post(INPUT, 0x101, pack_point(point));
@@ -812,9 +820,20 @@ fn unpack_point(value: isize) -> Point {
     }
 }
 unsafe fn foreign_window(hwnd: Handle) -> bool {
-    let mut pid = 0;
-    GetWindowThreadProcessId(hwnd, &mut pid);
-    pid != 0 && pid != GetCurrentProcessId()
+    if hwnd == 0 {
+        return false;
+    }
+    let own_pid = GetCurrentProcessId();
+    let mut hit_pid = 0;
+    GetWindowThreadProcessId(hwnd, &mut hit_pid);
+    for window in [hwnd, GetAncestor(hwnd, 2), GetAncestor(hwnd, 3)] {
+        let mut pid = 0;
+        GetWindowThreadProcessId(window, &mut pid);
+        if pid == own_pid {
+            return false;
+        }
+    }
+    hit_pid != 0
 }
 
 unsafe extern "system" fn controller_proc(
@@ -891,9 +910,6 @@ unsafe extern "system" fn controller_proc(
         }
         INPUT => {
             let point = unpack_point(lparam);
-            if !foreign_window(WindowFromPoint(point)) {
-                return 0;
-            }
             let mut dismiss = None;
             STATE.with(|cell| {
                 if let Some(state) = cell.borrow_mut().as_mut() {
@@ -931,6 +947,18 @@ unsafe extern "system" fn controller_proc(
             if let Some(callback) = dismiss {
                 callback();
             }
+            return 0;
+        }
+        OWN_INPUT => {
+            GENERATION.fetch_add(1, Ordering::AcqRel);
+            KillTimer(hwnd, SELECTION_TIMER);
+            STATE.with(|cell| {
+                if let Some(state) = cell.borrow_mut().as_mut() {
+                    state.down = None;
+                    state.last_click = None;
+                    state.pending = None;
+                }
+            });
             return 0;
         }
         0x113 if wparam == SELECTION_TIMER => {

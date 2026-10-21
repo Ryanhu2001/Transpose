@@ -33,6 +33,8 @@ xcrun swiftc -parse-as-library -swift-version 5 -O -sdk "$TRANSPOSE_SDK_PATH" \
     "$NATIVE_DIR/core/L10n.swift" \
     "$NATIVE_DIR/bridge/BridgeModels.swift" \
     "$NATIVE_DIR/platform/LoginItemManager.swift" \
+    "$NATIVE_DIR/platform/SelectionPolicy.swift" \
+    "$NATIVE_DIR/platform/SelectionMonitor.swift" \
     "$NATIVE_DIR/translation/TranslationService.swift" \
     "$NATIVE_DIR/translation/CLIRunner.swift" \
     "$NATIVE_DIR/translation/CLIProbe.swift" \

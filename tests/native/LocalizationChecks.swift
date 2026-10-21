@@ -31,6 +31,7 @@ func runLocalizationChecks() throws -> Int {
     checks += try require(L10n.text("Codex CLI 尚未登录或认证已失效，请在终端中登录后重试。") == "Codex CLI is not signed in or authentication expired. Sign in through Terminal and try again.", "动态 CLI 错误")
     checks += try require(L10n.text("Apple 翻译 · 0.1 秒") == "Apple Translate · 0.1 s", "现有译文的服务名与耗时")
     checks += try require(L10n.text("Apple 翻译 · 已缓存") == "Apple Translate · Cached", "现有译文的缓存状态")
+    checks += try require(L10n.text("正在读取选中文字…") == "Reading selected text…", "聊天兼容读取状态")
     checks += try require(L10n.text("已导入 8 条术语") == "Imported 8 terms", "动态词库状态")
     checks += try require(L10n.text("连接成功 · 0.3 秒\n翻译偏好") == "Connected · 0.3 s\n翻译偏好", "连接状态不得改写实际译文")
     return checks

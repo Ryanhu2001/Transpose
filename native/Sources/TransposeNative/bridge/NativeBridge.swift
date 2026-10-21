@@ -120,6 +120,9 @@ final class NativeBridge: NSObject {
         selection.start(onSelection: { [weak self] content in
             guard let self, self.settings.automaticSelection, !self.capture.isActive else { return }
             self.present(content)
+        }, onDeferredSelection: { [weak self] candidate in
+            guard let self, self.settings.automaticSelection, !self.capture.isActive else { return }
+            self.presentDeferredSelection(candidate)
         }, onDismiss: { [weak self] in self?.floating.hideButton() })
         capture.onCapture = { [weak self] text, anchor in
             self?.translate(SelectedContent(text: text, anchor: anchor, sourceApp: "屏幕圈选"), preservingCapture: true)
@@ -430,6 +433,33 @@ final class NativeBridge: NSObject {
         floating.showButton(at: content.anchor) { [weak self] in self?.translate(content) }
     }
 
+    private func presentDeferredSelection(_ candidate: DeferredSelection) {
+        dismiss()
+        floating.showButton(at: candidate.anchor) { [weak self] in
+            guard let self, self.settings.automaticSelection, !self.capture.isActive else { return }
+            self.dismiss()
+            let request = self.generation
+            var state = NativeResultState()
+            state.id = request
+            state.sourceApp = candidate.sourceApp
+            state.isLoading = true
+            state.loadingMessage = "正在读取选中文字…"
+            state.isPinned = self.resultState?.isPinned ?? false
+            state.provider = self.settings.provider.title
+            state.status = self.settings.provider.title
+            self.resultState = state
+            self.floating.showResult(state: state.dictionary, near: candidate.anchor)
+            self.publishResult()
+            self.selectionReadTask = Task { [weak self] in
+                guard let self else { return }
+                let content = await self.selection.resolve(candidate)
+                guard !Task.isCancelled, self.generation == request, !self.capture.isActive else { return }
+                if let content { self.translate(content, preservingResult: true) }
+                else { self.showError("没有读到选中文字。可以按 ⌥S 圈选屏幕中的内容。") }
+            }
+        }
+    }
+
     private func translateSelection() {
         guard !capture.isActive else { return }
         guard AXIsProcessTrusted() else { showError("划词翻译需要辅助功能权限。请在设置中允许 Transpose。"); return }
@@ -669,7 +699,8 @@ final class NativeBridge: NSObject {
     private func probeCapturePermission() {
         let preflight = CGPreflightScreenCaptureAccess()
         guard preflight else {
-            emit(["type": "permission_probe", "data": ["preflight": false, "effective": false]])
+            emit(["type": "permission_probe", "data": ["preflight": false, "effective": false,
+                                                        "accessibility": AXIsProcessTrusted()]])
             return
         }
         permissionProbeTask = Task { [weak self] in
@@ -678,10 +709,12 @@ final class NativeBridge: NSObject {
                 // not capture pixels or retain/log any returned window data.
                 _ = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
                 guard let self, !Task.isCancelled, !self.stopped else { return }
-                self.emit(["type": "permission_probe", "data": ["preflight": true, "effective": true]])
+                self.emit(["type": "permission_probe", "data": ["preflight": true, "effective": true,
+                                                                  "accessibility": AXIsProcessTrusted()]])
             } catch {
                 guard let self, !Task.isCancelled, !self.stopped else { return }
                 self.emit(["type": "permission_probe", "data": ["preflight": true, "effective": false,
+                                                               "accessibility": AXIsProcessTrusted(),
                                                                "errorCode": (error as NSError).code]])
             }
         }

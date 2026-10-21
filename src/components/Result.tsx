@@ -11,6 +11,7 @@ import {
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useEffect, useState } from "react";
 import type { NativeClient } from "../lib/useNative";
+import { startResultWindowDrag } from "../lib/resultWindow";
 import { Brand, type Translator } from "./common";
 export function Result({ client, t }: { client: NativeClient; t: Translator }) {
   const result = client.state?.result;
@@ -41,7 +42,21 @@ export function Result({ client, t }: { client: NativeClient; t: Translator }) {
   };
   return (
     <div className="result-shell">
-      <header className="result-header" data-tauri-drag-region="deep">
+      <header
+        className="result-header"
+        data-tauri-drag-region={isWindows ? undefined : "deep"}
+        onPointerDown={(event) => {
+          if (!isWindows || client.mode !== "tauri") return;
+          setWindowError("");
+          void startResultWindowDrag(event, () =>
+            getCurrentWindow().startDragging(),
+          ).catch(() =>
+            setWindowError(
+              t("Unable to move this window.", "暂时无法移动窗口。"),
+            ),
+          );
+        }}
+      >
         <div className="result-direction">
           <Brand small />
           <span>

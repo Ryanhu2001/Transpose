@@ -256,6 +256,7 @@ final class L10n: ObservableObject {
         "自动检测": "Auto Detect",
         "译文": "Translation",
         "正在翻译…": "Translating…",
+        "正在读取选中文字…": "Reading selected text…",
         "正在翻译": "Translating",
         "翻译选中文字": "Translate Selected Text",
         "翻译 · ⌃⌥D": "Translate · ⌃⌥D",

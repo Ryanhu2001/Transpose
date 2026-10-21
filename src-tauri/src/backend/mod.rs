@@ -12,7 +12,7 @@ use std::{
     collections::{HashMap, VecDeque},
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::Instant,
@@ -38,6 +38,7 @@ struct Data {
 pub struct Backend {
     path: PathBuf,
     smoke_test: bool,
+    result_test: AtomicBool,
     data: Mutex<Data>,
     emitter: Mutex<Option<Emitter>>,
     settings_transaction: Mutex<()>,
@@ -61,6 +62,7 @@ impl Backend {
         Ok(Self {
             path,
             smoke_test,
+            result_test: AtomicBool::new(false),
             data: Mutex::new(Data {
                 settings,
                 detected: if smoke_test {
@@ -193,7 +195,11 @@ impl Backend {
         if !payload.is_object() {
             return Err("Invalid request format.".into());
         }
-        if self.smoke_test && action != "snapshot" {
+        if self.smoke_test
+            && action != "snapshot"
+            && !(self.result_test.load(Ordering::Acquire)
+                && matches!(action, "result_pin" | "result_close"))
+        {
             return Err("This action is unavailable during the smoke test.".into());
         }
         match action {
@@ -409,6 +415,30 @@ impl Backend {
         self.publish_result();
     }
 
+    /// A local GUI fixture uses the production result and input hooks without
+    /// reading credentials, saving settings or sending a translation request.
+    pub fn prepare_result_test(&self) -> Result<(), String> {
+        if !self.smoke_test {
+            return Err("Result diagnostics require an isolated backend.".into());
+        }
+        let mut result = initial_result(
+            "Local interaction fixture",
+            "Windows diagnostics",
+            "english",
+            "Local test",
+            false,
+            true,
+        );
+        result["id"] = "windows-result-fixture".into();
+        result["output"] = "The translation window stays under your control.".into();
+        result["isLoading"] = false.into();
+        result["canRetry"] = false.into();
+        self.data.lock().unwrap().result = Some(result);
+        self.result_test.store(true, Ordering::Release);
+        self.publish_result();
+        Ok(())
+    }
+
     /// Starts a translation and returns immediately, allowing the existing
     /// result UI to render streamed deltas without blocking a bridge request.
     pub fn translate_text(
@@ -416,6 +446,9 @@ impl Backend {
         text: String,
         source_app: String,
     ) -> Result<Value, String> {
+        if self.smoke_test {
+            return Err("Translation is unavailable during diagnostics.".into());
+        }
         let _transaction = self.translation_transaction.lock().unwrap();
         let text = text.trim().to_owned();
         if text.is_empty() {
@@ -732,6 +765,33 @@ mod tests {
             .request("update_settings", json!({"preferences":"mutate"}))
             .await
             .is_err());
+        assert!(!directory.exists());
+    }
+
+    #[tokio::test]
+    async fn result_fixture_exercises_controls_without_credentials_or_translation() {
+        let directory =
+            std::env::temp_dir().join(format!("transpose-result-test-{}", uuid::Uuid::new_v4()));
+        let backend = Arc::new(Backend::new(directory.clone(), true).unwrap());
+        backend.prepare_result_test().unwrap();
+        assert_eq!(
+            backend.result_output().as_deref(),
+            Some("The translation window stays under your control.")
+        );
+        backend
+            .request("result_pin", json!({"pinned":true}))
+            .await
+            .unwrap();
+        assert!(backend.result_pinned());
+        assert!(backend
+            .request("key_save", json!({"value":"must-not-be-written"}))
+            .await
+            .is_err());
+        assert!(backend
+            .translate_text("must-not-be-sent".into(), "fixture".into())
+            .is_err());
+        backend.request("result_close", json!({})).await.unwrap();
+        assert!(backend.state()["result"].is_null());
         assert!(!directory.exists());
     }
 }

@@ -86,6 +86,12 @@ jobs:
             -ExecutablePath "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/transpose.exe" `
             -OutputDirectory ".build/windows-smoke/built"
 
+      - name: Test translation window dragging and controls
+        run: |
+          ./scripts/test-windows-result.ps1 `
+            -ExecutablePath "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/transpose.exe" `
+            -OutputDirectory ".build/windows-smoke/result"
+
       - name: Install and smoke test the packaged app
         run: |
           $installer = Get-ChildItem "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe" | Select-Object -First 1

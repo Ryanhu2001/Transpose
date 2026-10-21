@@ -1053,7 +1053,9 @@ body[data-route="result"] {
   padding: 0 11px 0 15px;
   gap: 6px;
   border-bottom: 1px solid var(--border);
+  -webkit-user-select: none;
   user-select: none;
+  touch-action: none;
 }
 .result-direction {
   display: flex;

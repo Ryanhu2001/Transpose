@@ -184,7 +184,7 @@ describe("Windows settings", () => {
     expect(services).toContain("Prepare Language Packs");
   });
 
-  it("marks the floating result header as a native drag region", async () => {
+  it("uses explicit Windows header dragging while keeping result controls available", async () => {
     const client = await clientFor("?preview=1&platform=windows");
     const state = client.state as BridgeState;
     state.result = null;
@@ -195,7 +195,7 @@ describe("Windows settings", () => {
       }),
     );
 
-    expect(html).toMatch(/<header[^>]*data-tauri-drag-region="deep"/);
+    expect(html).not.toContain("data-tauri-drag-region");
     expect(html).toContain('aria-label="Pin window"');
     expect(html).toContain('aria-label="Close"');
     expect(html).toContain('aria-label="Resize translation window"');
@@ -208,5 +208,6 @@ describe("Windows settings", () => {
     );
 
     expect(html).not.toContain("result-resize-handle");
+    expect(html).toMatch(/<header[^>]*data-tauri-drag-region="deep"/);
   });
 });
