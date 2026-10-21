@@ -354,8 +354,14 @@ mod tests {
                         other => panic!("Expected fixture request: {other:?}"),
                     }
                 };
+                // Windows inherits the listener's nonblocking mode on accept.
+                // The fixture bounds accept above, then uses timed blocking IO.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
                 let mut incoming = Vec::new();
                 let header_end = loop {
