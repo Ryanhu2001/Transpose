@@ -19,7 +19,7 @@ export function createDemoTransport(): NativeTransport {
   const previewPermissions = params.get("permissions");
   const state: BridgeState = {
     app: {
-      version: "0.7.0-dev",
+      version: "0.7.1-dev",
       platform: windows ? "windows" : "macos",
       ...(windows
         ? {

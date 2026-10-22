@@ -117,6 +117,7 @@ pub async fn app_updates(
             arg.as_str(),
             "--smoke-test"
                 | "--windows-result-test"
+                | "--windows-browser-test"
                 | "--windows-platform-test"
                 | "--capture-permission-probe"
         )

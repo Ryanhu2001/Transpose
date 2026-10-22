@@ -16,6 +16,32 @@ static ANCHOR: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 static LAST_RESULT: Mutex<Option<String>> = Mutex::new(None);
 static RESULT_TEST_READY: AtomicBool = AtomicBool::new(false);
 static RESULT_MINIMUM: Mutex<Option<tauri::PhysicalSize<u32>>> = Mutex::new(None);
+static BROWSER_TEST_READY: AtomicBool = AtomicBool::new(false);
+static BROWSER_TEST_REPORT: Mutex<()> = Mutex::new(());
+static BROWSER_TEST_STATE: Mutex<BrowserTestState> = Mutex::new(BrowserTestState {
+    callbacks: 0,
+    last_case: "none",
+    last_match: false,
+    unexpected: false,
+    platform_error: false,
+});
+
+struct BrowserTestState {
+    callbacks: u64,
+    last_case: &'static str,
+    last_match: bool,
+    unexpected: bool,
+    platform_error: bool,
+}
+
+fn browser_fixture_case(text: &str) -> Option<&'static str> {
+    match text {
+        "Transposing words should feel effortless." => Some("cold"),
+        "Keep the original close while reading the translation." => Some("warm"),
+        "Editable text can also be translated." => Some("editable"),
+        _ => None,
+    }
+}
 
 fn result_minimum_size(
     scale: f64,
@@ -65,6 +91,10 @@ fn result_test_enabled() -> bool {
     std::env::args().any(|arg| arg == "--windows-result-test")
 }
 
+fn browser_test_enabled() -> bool {
+    std::env::args().any(|arg| arg == "--windows-browser-test")
+}
+
 fn backend() -> Result<&'static Arc<Backend>, String> {
     BACKEND
         .get()
@@ -73,7 +103,8 @@ fn backend() -> Result<&'static Arc<Backend>, String> {
 
 pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let result_test = result_test_enabled();
-    let smoke = result_test || std::env::args().any(|arg| arg == "--smoke-test");
+    let browser_test = browser_test_enabled();
+    let smoke = result_test || browser_test || std::env::args().any(|arg| arg == "--smoke-test");
     let data_dir = if smoke {
         std::env::temp_dir().join(format!("transpose-smoke-{}", std::process::id()))
     } else {
@@ -120,7 +151,7 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         })
         .build()?;
     refresh_result_minimum(&result_window);
-    if smoke && !result_test {
+    if smoke && !result_test && !browser_test {
         state.set_platform_status(true, false);
         return Ok(());
     }
@@ -129,9 +160,28 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let dismiss_state = state.clone();
     let error_state = state.clone();
     let recognize_state = state.clone();
+    let browser_app = app.handle().clone();
     platform::start(platform::Callbacks {
         on_translate: Arc::new(move |text, source, point| {
             if result_test {
+                return;
+            }
+            if browser_test {
+                let case = browser_fixture_case(&text);
+                if let Ok(mut test) = BROWSER_TEST_STATE.lock() {
+                    test.callbacks += 1;
+                    test.last_case = case.unwrap_or("unexpected");
+                    test.last_match = case.is_some();
+                    test.unexpected |= case.is_none();
+                }
+                // Exercise the actual native button callback/result path with
+                // fixed local content. No selected text, credentials or API
+                // requests leave this isolated diagnostic backend.
+                if case.is_some() {
+                    set_anchor(point);
+                    let _ = translate_state.prepare_result_test();
+                }
+                write_browser_test_report(&browser_app);
                 return;
             }
             set_anchor(point);
@@ -151,6 +201,12 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             }
         }),
         on_error: Arc::new(move |error| {
+            if browser_test {
+                if let Ok(mut test) = BROWSER_TEST_STATE.lock() {
+                    test.platform_error = true;
+                }
+                return;
+            }
             if result_test {
                 return;
             }
@@ -160,7 +216,7 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             });
         }),
         on_recognizing: Arc::new(move |point| {
-            if result_test {
+            if result_test || browser_test {
                 return;
             }
             set_anchor(point);
@@ -168,6 +224,20 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         }),
     })
     .map_err(std::io::Error::other)?;
+    if browser_test {
+        platform::set_automatic_selection(true);
+        state.set_platform_status(true, false);
+        BROWSER_TEST_READY.store(true, Ordering::Release);
+        write_browser_test_report(app.handle());
+        let handle = app.handle().clone();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                write_browser_test_report(&handle);
+            }
+        });
+        return Ok(());
+    }
     if result_test {
         state.set_platform_status(true, false);
         set_anchor((120, 120));
@@ -218,6 +288,52 @@ fn emit_event(app: &AppHandle, event: Value) {
     let _ = app.emit_to("settings", "native:event", event.clone());
     let _ = app.emit_to("result", "native:event", event);
     write_result_test_report(app);
+    write_browser_test_report(app);
+}
+
+fn write_browser_test_report(app: &AppHandle) {
+    if !browser_test_enabled() {
+        return;
+    }
+    // Events and the periodic observer can arrive together. Keep each report
+    // atomic without blocking the UI thread behind an observer's window query.
+    let Ok(_report_guard) = BROWSER_TEST_REPORT.try_lock() else {
+        return;
+    };
+    let args: Vec<_> = std::env::args_os().collect();
+    let Some(path) = args
+        .iter()
+        .position(|arg| arg == "--diagnostics-output")
+        .and_then(|index| args.get(index + 1))
+        .map(std::path::PathBuf::from)
+    else {
+        return;
+    };
+    let Some(window) = app.get_webview_window("result") else {
+        return;
+    };
+    let (callbacks, case, matched, unexpected, platform_error) = {
+        let Ok(test) = BROWSER_TEST_STATE.lock() else {
+            return;
+        };
+        (test.callbacks, test.last_case, test.last_match, test.unexpected, test.platform_error)
+    };
+    let report = json!({
+        "ready": BROWSER_TEST_READY.load(Ordering::Acquire),
+        "networkRequests": 0,
+        "selectionCallbacks": callbacks,
+        "lastSelectionCase": case,
+        "lastSelectionMatch": matched,
+        "unexpectedSelection": unexpected,
+        "platformError": platform_error,
+        "resultFixtureShown": window.is_visible().unwrap_or(false),
+        "window": {"hwnd": window.hwnd().map(|handle| (handle.0 as usize).to_string()).unwrap_or_default()},
+        "platform": platform::selection_test_snapshot(),
+    });
+    let temporary = path.with_extension("browser-tmp");
+    if std::fs::write(&temporary, report.to_string()).is_ok() {
+        let _ = std::fs::rename(temporary, path);
+    }
 }
 
 fn write_result_test_report(app: &AppHandle) {

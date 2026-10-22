@@ -1,6 +1,6 @@
 [package]
 name = "transpose"
-version = "0.7.0"
+version = "0.7.1"
 description = "A small native translation companion"
 authors = ["Ryan"]
 license = "MIT"
