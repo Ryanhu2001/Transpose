@@ -107,15 +107,33 @@ jobs:
           if ((Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) {
             throw "The published browser baseline checksum changed."
           }
-          $installation = Start-Process -FilePath $installer -ArgumentList @("/S", "/D=$baseline/app") -Wait -PassThru
+          # NSIS deletes forward slashes from $INSTDIR rather than normalizing them.
+          # /D must be the final, unquoted argument and contain an absolute Windows path.
+          $installDirectory = [System.IO.Path]::GetFullPath((Join-Path $baseline "app")).Replace('/', '\')
+          $installation = Start-Process -FilePath $installer -ArgumentList "/S /D=$installDirectory" -Wait -PassThru
           if ($installation.ExitCode -ne 0) { throw "Baseline installer exited with code $($installation.ExitCode)." }
+          $baselineExecutable = Join-Path $installDirectory "transpose.exe"
+          if (-not (Test-Path -LiteralPath $baselineExecutable -PathType Leaf)) {
+            Get-ChildItem -LiteralPath $baseline -Recurse -ErrorAction SilentlyContinue | Select-Object FullName
+            throw "The published baseline installer did not create $baselineExecutable."
+          }
+          $version = [Diagnostics.FileVersionInfo]::GetVersionInfo($baselineExecutable).ProductVersion
+          if ($version -notin @("0.7.0", "0.7.0.0")) { throw "Unexpected browser baseline version: $version." }
+          Get-CimInstance Win32_Process -Filter "Name = 'transpose.exe'" | Where-Object {
+            $_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $baselineExecutable, [StringComparison]::OrdinalIgnoreCase)
+          } | ForEach-Object {
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+            Wait-Process -Id $_.ProcessId -Timeout 5 -ErrorAction SilentlyContinue
+          }
+          "TRANSPOSE_BROWSER_BASELINE=$baselineExecutable" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Output "Browser baseline: $baselineExecutable (version $version)"
 
       - name: Test Chrome and Edge text selection
         timeout-minutes: 8
         run: |
           ./scripts/test-windows-browser.ps1 `
             -ExecutablePath "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/transpose.exe" `
-            -BaselineExecutablePath ".build/windows-browser-baseline/app/transpose.exe" `
+            -BaselineExecutablePath "$env:TRANSPOSE_BROWSER_BASELINE" `
             -OutputDirectory ".build/windows-smoke/browser"
 
       - name: Install and smoke test the packaged app
