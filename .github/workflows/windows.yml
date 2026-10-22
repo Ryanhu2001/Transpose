@@ -97,6 +97,27 @@ jobs:
             -ExecutablePath "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/transpose.exe" `
             -OutputDirectory ".build/windows-smoke/result"
 
+      - name: Prepare published Windows browser baseline
+        run: |
+          $baseline = Join-Path $env:GITHUB_WORKSPACE ".build/windows-browser-baseline"
+          New-Item -Path $baseline -ItemType Directory -Force | Out-Null
+          $installer = Join-Path $baseline "Transpose-0.7.0-Windows-x64-setup.exe"
+          Invoke-WebRequest "https://github.com/Ryanhu2001/Transpose/releases/download/v0.7.0/Transpose-0.7.0-Windows-x64-setup.exe" -OutFile $installer
+          $expected = "7b5bb2a0a8606f2c0b2cd1fb86d5d794f9678d4e9c6d3bc3041b4cac99fdce6e"
+          if ((Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) {
+            throw "The published browser baseline checksum changed."
+          }
+          $installation = Start-Process -FilePath $installer -ArgumentList @("/S", "/D=$baseline/app") -Wait -PassThru
+          if ($installation.ExitCode -ne 0) { throw "Baseline installer exited with code $($installation.ExitCode)." }
+
+      - name: Test Chrome and Edge text selection
+        timeout-minutes: 8
+        run: |
+          ./scripts/test-windows-browser.ps1 `
+            -ExecutablePath "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/transpose.exe" `
+            -BaselineExecutablePath ".build/windows-browser-baseline/app/transpose.exe" `
+            -OutputDirectory ".build/windows-smoke/browser"
+
       - name: Install and smoke test the packaged app
         run: |
           $installers = @(Get-ChildItem "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe")

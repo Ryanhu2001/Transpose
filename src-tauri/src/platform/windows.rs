@@ -7,7 +7,7 @@ use std::{
     ptr::{null, null_mut},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        mpsc, Arc,
+        mpsc, Arc, OnceLock,
     },
     thread,
     time::{Duration, Instant},
@@ -20,7 +20,7 @@ use windows::Win32::{
         COINIT_MULTITHREADED,
     },
     UI::Accessibility::{
-        CUIAutomation, IUIAutomation, IUIAutomation2, IUIAutomationElement,
+        CUIAutomation, CUIAutomation8, IUIAutomation, IUIAutomation2, IUIAutomationElement,
         IUIAutomationTextChildPattern, IUIAutomationTextPattern, IUIAutomationTextPattern2,
         IUIAutomationTreeWalker, UIA_TextChildPatternId, UIA_TextPattern2Id, UIA_TextPatternId,
     },
@@ -44,6 +44,9 @@ static CONTROLLER: AtomicUsize = AtomicUsize::new(0);
 static AUTOMATIC: AtomicBool = AtomicBool::new(true);
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 static CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static SELECTION_LAUNCHER: AtomicUsize = AtomicUsize::new(0);
+static SELECTION_READS: AtomicU64 = AtomicU64::new(0);
+static SELECTION_REASON: AtomicUsize = AtomicUsize::new(0);
 const START_CAPTURE: u32 = 0x8001;
 const CLEAR_OUTLINE: u32 = 0x8002;
 const SELECTED: u32 = 0x8003;
@@ -61,6 +64,8 @@ const EX_TOPMOST: u32 = 0x8;
 const EX_NOACTIVATE: u32 = 0x08000000;
 const EX_LAYERED: u32 = 0x80000;
 const EX_TRANSPARENT: u32 = 0x20;
+const MAX_SELECTION_ANCESTORS: usize = 64;
+const MAX_SELECTION_CANDIDATES: usize = 4 * MAX_SELECTION_ANCESTORS;
 
 thread_local! { static STATE: RefCell<Option<State>> = const { RefCell::new(None) }; }
 
@@ -287,6 +292,8 @@ unsafe extern "system" {
     fn BeginPaint(hwnd: Handle, paint: *mut Paint) -> Handle;
     fn EndPaint(hwnd: Handle, paint: *const Paint) -> i32;
     fn GetClientRect(hwnd: Handle, rect: *mut Rect) -> i32;
+    fn GetWindowRect(hwnd: Handle, rect: *mut Rect) -> i32;
+    fn IsWindowVisible(hwnd: Handle) -> i32;
     fn FillRect(dc: Handle, rect: *const Rect, brush: Handle) -> i32;
     fn DrawTextW(dc: Handle, text: *const u16, count: i32, rect: *mut Rect, format: u32) -> i32;
     fn GetDC(hwnd: Handle) -> Handle;
@@ -433,6 +440,7 @@ pub fn start(callbacks: Callbacks) -> Result<(), String> {
         let overlay = CreateWindowExW(EX_TOOLWINDOW | EX_TOPMOST, capture_class.as_ptr(), title.as_ptr(), WS_POPUP, 0, 0, 0, 0, 0, 0, instance, null());
         if controller == 0 || launcher == 0 || overlay == 0 { let _ = ready_tx.send(Err("Windows could not create the translation windows.".into())); return; }
         CONTROLLER.store(controller as usize, Ordering::Release);
+        SELECTION_LAUNCHER.store(launcher as usize, Ordering::Release);
         let (read_tx, read_rx) = mpsc::channel::<ReadRequest>();
         thread::Builder::new().name("transpose-selection".into()).spawn(move || selection_worker(read_rx)).ok();
         STATE.with(|state| *state.borrow_mut() = Some(State { callbacks: callbacks.clone(), launcher, overlay, selection: None, pending: None, read: read_tx, down: None, last_click: None, capture: None }));
@@ -479,6 +487,43 @@ pub fn set_automatic_selection(enabled: bool) {
 }
 pub fn stop() {
     let _ = post(STOP, 0, 0);
+}
+
+fn selection_test_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::args_os().any(|arg| arg == "--windows-browser-test"))
+}
+
+fn selection_test_reason(reason: usize) {
+    if selection_test_enabled() {
+        SELECTION_REASON.store(reason, Ordering::Release);
+    }
+}
+
+/// Explicit fixture diagnostics contain only window geometry and state codes.
+/// Normal launches never expose selected text, application titles or history.
+pub fn selection_test_snapshot() -> serde_json::Value {
+    if !selection_test_enabled() {
+        return serde_json::Value::Null;
+    }
+    let hwnd = SELECTION_LAUNCHER.load(Ordering::Acquire) as Handle;
+    let mut rect = Rect::default();
+    let visible = unsafe { hwnd != 0 && IsWindowVisible(hwnd) != 0 };
+    unsafe { GetWindowRect(hwnd, &mut rect) };
+    let reason = match SELECTION_REASON.load(Ordering::Acquire) {
+        1 => "reading",
+        2 => "empty",
+        3 => "selected",
+        4 => "button",
+        5 => "stale",
+        _ => "idle",
+    };
+    serde_json::json!({
+        "launcher": {"hwnd":hwnd.to_string(),"visible":visible,
+            "left":rect.left,"top":rect.top,"right":rect.right,"bottom":rect.bottom},
+        "reason":reason,"requests":SELECTION_READS.load(Ordering::Acquire),
+        "generation":GENERATION.load(Ordering::Acquire)
+    })
 }
 pub fn ocr_languages() -> Vec<String> {
     thread::spawn(|| unsafe {
@@ -672,7 +717,17 @@ $text.Text = "Transpose selection fixture`r`nNative UI Automation selection"
 $text.AcceptsReturn = $true
 $text.FontSize = 20
 $text.Margin = [System.Windows.Thickness]::new(12)
-$window.Content = $text
+# Each GroupBox is a real UIA control ancestor. A text selection can be much
+# deeper than ten parents in a browser page or a richly structured document.
+$content = $text
+for ($index = 0; $index -lt 18; $index++) {
+    $group = [System.Windows.Controls.GroupBox]::new()
+    $group.BorderThickness = [System.Windows.Thickness]::new(0)
+    $group.Padding = [System.Windows.Thickness]::new(0)
+    $group.Content = $content
+    $content = $group
+}
+$window.Content = $content
 $window.Add_Loaded({
     [Console]::Error.WriteLine('wpf:loaded')
     $window.Activate() | Out-Null
@@ -758,7 +813,7 @@ $window.ShowDialog() | Out-Null
             let walker = automation
                 .ControlViewWalker()
                 .map_err(|error| format!("create WPF tree walker: {error}"))?;
-            let mut queue = vec![root];
+            let mut queue = vec![root.clone()];
             let mut checked = 0;
             let mut found = None;
             while let Some(element) = queue.pop() {
@@ -793,6 +848,24 @@ $window.ShowDialog() | Out-Null
             let (element, text) = found.ok_or_else(|| {
                 format!("WPF fixture exposed no selected TextPattern in {checked} UIA elements.")
             })?;
+            let mut depth = 0;
+            let mut ancestor = Some(element.clone());
+            while let Some(current) = ancestor {
+                if automation
+                    .CompareElements(&current, &root)
+                    .is_ok_and(|same| same.as_bool())
+                {
+                    break;
+                }
+                depth += 1;
+                if depth > 48 {
+                    return Err("The nested selection fixture exceeded its ancestor bound.".into());
+                }
+                ancestor = walker.GetParentElement(&current).ok();
+            }
+            if depth <= 10 {
+                return Err("The nested selection fixture did not expose its deep UIA ancestry.".into());
+            }
             element
                 .SetFocus()
                 .map_err(|error| format!("focus WPF text fixture: {error}"))?;
@@ -1135,6 +1208,7 @@ unsafe extern "system" fn controller_proc(
                             DeleteObject(region);
                         }
                         SetWindowPos(state.launcher, -1, x, y, size, size, 0x10 | 0x40);
+                        selection_test_reason(4);
                         SetTimer(hwnd, LAUNCHER_TIMER, 6000, null());
                         InvalidateRect(state.launcher, null(), 0);
                     }
@@ -1298,8 +1372,10 @@ fn selection_worker(requests: mpsc::Receiver<ReadRequest>) {
         if CoInitializeEx(None, COINIT_MULTITHREADED).is_err() {
             return;
         }
+        // The Windows 8+ client exposes IUIAutomation2 timeouts. The
+        // legacy CUIAutomation class can silently omit those bounds.
         let automation: Result<IUIAutomation, _> =
-            CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER);
+            CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER);
         if let Ok(automation) = automation {
             if let Ok(settings) = automation.cast::<IUIAutomation2>() {
                 let _ = settings.SetConnectionTimeout(150);
@@ -1312,8 +1388,13 @@ fn selection_worker(requests: mpsc::Receiver<ReadRequest>) {
                 if request.generation != GENERATION.load(Ordering::Acquire)
                     || GetForegroundWindow() != request.foreground
                 {
+                    selection_test_reason(5);
                     continue;
                 }
+                if selection_test_enabled() {
+                    SELECTION_READS.fetch_add(1, Ordering::AcqRel);
+                }
+                selection_test_reason(1);
                 let mut content = read_selection(&automation, &request);
                 if content.is_none()
                     && request.generation == GENERATION.load(Ordering::Acquire)
@@ -1325,6 +1406,7 @@ fn selection_worker(requests: mpsc::Receiver<ReadRequest>) {
                     }
                 }
                 if let Some((text, app)) = content {
+                    selection_test_reason(3);
                     let selection = Box::new(Selection {
                         text,
                         app,
@@ -1336,6 +1418,8 @@ fn selection_worker(requests: mpsc::Receiver<ReadRequest>) {
                     if post(SELECTED, 0, pointer as isize).is_err() {
                         drop(Box::from_raw(pointer));
                     }
+                } else {
+                    selection_test_reason(2);
                 }
             }
         }
@@ -1377,57 +1461,65 @@ unsafe fn read_selection(
     let mut candidates = Vec::new();
     let mut search_roots = Vec::new();
     if let Ok(walker) = automation.ControlViewWalker() {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        let root = automation
+            .ElementFromHandle(HWND(foreground_root as *mut c_void))
+            .ok();
+        let mut seeds = Vec::new();
+        // Chromium creates its web accessibility provider on demand. Query
+        // the source-owned renderer HWND through UIA as well as the focused
+        // and pointed elements: a cold point query can still hit browser UI.
+        // No browser flags, synthetic input or clipboard access are needed.
+        let mut renderer_handles = native_candidates.clone();
+        renderer_handles.sort_unstable();
+        renderer_handles.dedup();
+        for handle in renderer_handles {
+            if Instant::now() >= deadline {
+                return None;
+            }
+            if is_chromium_renderer(&window_class(handle)) {
+                if let Ok(element) = automation.ElementFromHandle(HWND(handle as *mut c_void)) {
+                    seeds.push(element);
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        if let Ok(element) = automation.GetFocusedElement() {
+            seeds.push(element);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        if let Ok(element) = automation.ElementFromPoint(POINT {
+            x: request.anchor.0,
+            y: request.anchor.1,
+        }) {
+            seeds.push(element);
+        }
         // A packaged app may put its focused content in a different process
         // from the foreground ApplicationFrameWindow. Verify its ancestor
         // window instead of requiring identical foreground/content PIDs.
-        for seed in [
-            automation.GetFocusedElement().ok(),
-            automation
-                .ElementFromPoint(POINT {
-                    x: request.anchor.0,
-                    y: request.anchor.1,
-                })
-                .ok(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            match safe_element_chain(automation, &walker, seed, foreground_root, deadline) {
+        for seed in seeds {
+            if Instant::now() >= deadline {
+                return None;
+            }
+            match safe_element_chain(
+                automation, &walker, seed, foreground_root, root.as_ref(), deadline,
+            ) {
                 ElementChain::Protected => return None,
                 ElementChain::Safe(chain) => {
                     if let Some(first) = chain.first() {
                         search_roots.push(first.clone());
                     }
                     for element in chain {
-                        add_element(automation, &mut candidates, element);
+                        add_element(&mut candidates, element);
                     }
                 }
                 ElementChain::Unrelated => {}
-            }
-        }
-        // TextChild identifies a text container without treating its entire
-        // child range or caret as selected text.
-        let initial = candidates.clone();
-        for element in initial {
-            if Instant::now() >= deadline {
-                break;
-            }
-            if let Ok(child) =
-                element.GetCurrentPatternAs::<IUIAutomationTextChildPattern>(UIA_TextChildPatternId)
-            {
-                if let Ok(container) = child.TextContainer() {
-                    if let ElementChain::Safe(chain) = safe_element_chain(
-                        automation,
-                        &walker,
-                        container,
-                        foreground_root,
-                        deadline,
-                    ) {
-                        for element in chain {
-                            add_element(automation, &mut candidates, element);
-                        }
-                    }
-                }
             }
         }
         for element in &candidates {
@@ -1445,6 +1537,40 @@ unsafe fn read_selection(
                     return Some((text, window_title(request.foreground)));
                 }
                 return None;
+            }
+        }
+        // Prefer a real selected TextPattern before requesting TextChild on
+        // every ancestor. Cold browser providers can otherwise spend the
+        // entire read budget hydrating patterns before GetSelection is tried.
+        // TextChild is only a route to its validated container; its child or
+        // document range is never treated as a user selection.
+        for element in &candidates {
+            if Instant::now() >= deadline {
+                break;
+            }
+            if let Ok(child) =
+                element.GetCurrentPatternAs::<IUIAutomationTextChildPattern>(UIA_TextChildPatternId)
+            {
+                if let Ok(container) = child.TextContainer() {
+                    if let ElementChain::Safe(chain) = safe_element_chain(
+                        automation,
+                        &walker,
+                        container,
+                        foreground_root,
+                        root.as_ref(),
+                        deadline,
+                    ) {
+                        if let Some(text) = chain
+                            .first()
+                            .and_then(|element| selected_pattern_text(element))
+                        {
+                            if GetForegroundWindow() == request.foreground {
+                                return Some((text, window_title(request.foreground)));
+                            }
+                            return None;
+                        }
+                    }
+                }
             }
         }
         // Some note editors focus a container while exposing the selected
@@ -1474,6 +1600,7 @@ unsafe fn read_selection(
                     &walker,
                     element.clone(),
                     foreground_root,
+                    root.as_ref(),
                     deadline,
                 ) {
                     if let Some(text) = selected_pattern_text(&element) {
@@ -1510,17 +1637,17 @@ unsafe fn safe_element_chain(
     walker: &IUIAutomationTreeWalker,
     seed: IUIAutomationElement,
     foreground_root: Handle,
+    root: Option<&IUIAutomationElement>,
     deadline: Instant,
 ) -> ElementChain {
-    let root = automation
-        .ElementFromHandle(HWND(foreground_root as *mut c_void))
-        .ok();
     let mut chain = Vec::new();
     let mut current = Some(seed);
     let mut belongs = false;
     let mut protected = false;
     let mut uncertain = false;
-    for _ in 0..10 {
+    // Web content can include dozens of semantic ancestors before reaching
+    // its renderer HWND. Keep the time bound while allowing that ancestry.
+    for _ in 0..MAX_SELECTION_ANCESTORS {
         if Instant::now() >= deadline {
             return ElementChain::Unrelated;
         }
@@ -1531,18 +1658,23 @@ unsafe fn safe_element_chain(
             Ok(value) => protected |= value.as_bool(),
             Err(_) => uncertain = true,
         }
-        if let Ok(handle) = element.CurrentNativeWindowHandle() {
-            belongs |= window_belongs_to(handle.0 as Handle, foreground_root);
-        }
-        if let Some(root) = &root {
-            belongs |= automation
-                .CompareElements(&element, root)
-                .is_ok_and(|v| v.as_bool());
-        }
-        current = walker.GetParentElement(&element).ok();
-        let at_root = element
+        let handle = element
             .CurrentNativeWindowHandle()
-            .is_ok_and(|handle| handle.0 as Handle == foreground_root);
+            .ok()
+            .map(|handle| handle.0 as Handle);
+        belongs |= handle.is_some_and(|handle| window_belongs_to(handle, foreground_root));
+        let at_root = handle == Some(foreground_root)
+            || root.is_some_and(|root| {
+                automation
+                    .CompareElements(&element, root)
+                    .is_ok_and(|v| v.as_bool())
+            });
+        belongs |= at_root;
+        current = if at_root {
+            None
+        } else {
+            walker.GetParentElement(&element).ok()
+        };
         chain.push(element);
         if at_root {
             break;
@@ -1558,17 +1690,16 @@ unsafe fn safe_element_chain(
         ElementChain::Safe(chain)
     }
 }
-unsafe fn add_element(
-    automation: &IUIAutomation,
+fn add_element(
     elements: &mut Vec<IUIAutomationElement>,
     element: IUIAutomationElement,
 ) {
-    if elements.len() < 32
-        && !elements.iter().any(|existing| {
-            automation
-                .CompareElements(existing, &element)
-                .is_ok_and(|v| v.as_bool())
-        })
+    // Four seeds can each contribute a full bounded ancestor chain. Avoid
+    // truncating a deep Document or a later focused/pointed seed. Pointer
+    // identity only avoids exact duplicates locally; different COM wrappers
+    // may remain, with no cross-process comparison for each pair.
+    if elements.len() < MAX_SELECTION_CANDIDATES
+        && !elements.iter().any(|existing| existing.as_raw() == element.as_raw())
     {
         elements.push(element);
     }
@@ -1637,6 +1768,14 @@ fn legacy_edit_kind(class: &str) -> Option<bool> {
     } else {
         None
     }
+}
+fn is_chromium_renderer(class: &str) -> bool {
+    class.eq_ignore_ascii_case("Chrome_RenderWidgetHostHWND")
+}
+unsafe fn window_class(window: Handle) -> String {
+    let mut class = [0u16; 128];
+    let length = GetClassNameW(window, class.as_mut_ptr(), class.len() as i32);
+    String::from_utf16_lossy(&class[..length.max(0) as usize])
 }
 unsafe fn bounded_message(
     window: Handle,
@@ -2316,7 +2455,15 @@ pub fn launch_at_login() -> bool {
 
 #[cfg(test)]
 mod selection_compatibility_tests {
-    use super::{clean_selection, legacy_edit_kind, legacy_selection_text};
+    use super::{clean_selection, is_chromium_renderer, legacy_edit_kind, legacy_selection_text};
+    #[test]
+    fn chromium_activation_is_limited_to_renderer_windows() {
+        assert!(is_chromium_renderer("Chrome_RenderWidgetHostHWND"));
+        assert!(is_chromium_renderer("chrome_renderwidgethosthwnd"));
+        assert!(!is_chromium_renderer("Chrome_WidgetWin_1"));
+        assert!(!is_chromium_renderer("Chrome_RenderWidgetHostHWND-unrelated"));
+        assert!(!is_chromium_renderer("EDIT"));
+    }
     #[test]
     fn native_edit_classes_are_narrow() {
         assert_eq!(legacy_edit_kind("EDIT"), Some(false));

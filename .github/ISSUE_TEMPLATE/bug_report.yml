@@ -8,7 +8,7 @@ body:
     id: version
     attributes:
       label: Transpose version / 版本
-      placeholder: 0.7.0
+      placeholder: 0.7.1
     validations:
       required: true
   - type: input
