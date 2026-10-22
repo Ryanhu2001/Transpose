@@ -28,9 +28,42 @@ enum SelectionPolicy {
         return ["com.electron.lark", "com.tencent.xinWeChat"].contains(bundle)
     }
 
+    static func isNotionApplication(_ bundle: String?) -> Bool {
+        bundle == "notion.id"
+    }
+
+    static func selectionAncestorLimit(_ bundle: String?) -> Int {
+        isNotionApplication(bundle) ? 24 : 6
+    }
+
+    // Electron debounces AXManualAccessibility for two seconds. Keep this
+    // cold-start wait separate from the time spent querying the AX tree.
+    static let notionAccessibilityActivationDelay: TimeInterval = 2.1
+
+    @MainActor
+    static func readWithActivationRetry<Content>(read: (_ allowActivationRetry: Bool) async -> Content,
+                                                  retryAt: (Content) -> TimeInterval?,
+                                                  isCurrent: () -> Bool, uptime: () -> TimeInterval,
+                                                  sleep: (TimeInterval) async throws -> Void) async -> Content? {
+        guard !Task.isCancelled, isCurrent() else { return nil }
+        var result = await read(true)
+        guard !Task.isCancelled, isCurrent() else { return nil }
+        if let readyAt = retryAt(result) {
+            let delay = max(0, readyAt - uptime())
+            if delay > 0 {
+                do { try await sleep(delay) }
+                catch { return nil }
+            }
+            guard !Task.isCancelled, isCurrent() else { return nil }
+            result = await read(false)
+        }
+        guard !Task.isCancelled, isCurrent() else { return nil }
+        return result
+    }
+
     static func needsManualAccessibility(_ bundle: String?) -> Bool {
         guard let bundle else { return false }
-        if ["com.electron.lark"].contains(bundle) { return true }
+        if ["com.electron.lark"].contains(bundle) || isNotionApplication(bundle) { return true }
         return ["com.google.Chrome", "org.chromium.Chromium", "com.microsoft.edgemac",
                 "com.brave.Browser", "company.thebrowser.Browser", "com.vivaldi.Vivaldi",
                 "com.todesktop.", "com.microsoft.VSCode", "com.cursor.Cursor"]

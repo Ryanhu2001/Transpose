@@ -26,7 +26,10 @@ final class SelectionMonitor {
         didSet {
             if !isEnabled {
                 cancelPendingRead()
+                cancelPriming()
                 onDismiss?()
+            } else if !monitors.isEmpty {
+                primeRunningNotionApplications()
             }
         }
     }
@@ -40,6 +43,9 @@ final class SelectionMonitor {
     }
 
     private var monitors: [Any] = []
+    private var activationObserver: NSObjectProtocol?
+    private var primingTasks: [pid_t: Task<Void, Never>] = [:]
+    private var primingGeneration = 0
     private var pendingRead: Task<Void, Never>?
     private var generation = 0
     private var dragged = false
@@ -68,10 +74,24 @@ final class SelectionMonitor {
         }) {
             monitors.append(monitor)
         }
+        activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] notification in
+            MainActor.assumeIsolated {
+                guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+                self?.primeNotionApplication(app)
+            }
+        }
+        primeRunningNotionApplications()
     }
 
     func stop() {
         cancelPendingRead()
+        cancelPriming()
+        if let activationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(activationObserver)
+            self.activationObserver = nil
+        }
         monitors.forEach(NSEvent.removeMonitor)
         monitors.removeAll()
         onSelection = nil
@@ -81,6 +101,39 @@ final class SelectionMonitor {
         dragged = false
         gestureStart = nil
         gesturePID = nil
+    }
+
+    private func cancelPriming() {
+        primingGeneration &+= 1
+        primingTasks.values.forEach { $0.cancel() }
+        primingTasks.removeAll()
+    }
+
+    private func primeRunningNotionApplications() {
+        guard isEnabled, Self.isTrusted else { return }
+        for app in NSWorkspace.shared.runningApplications {
+            primeNotionApplication(app)
+        }
+    }
+
+    private func primeNotionApplication(_ app: NSRunningApplication) {
+        guard isEnabled, Self.isTrusted, SelectionPolicy.isNotionApplication(app.bundleIdentifier) else { return }
+        let pid = app.processIdentifier
+        guard primingTasks[pid] == nil else { return }
+        let request = primingGeneration
+        primingTasks[pid] = Task { [weak self] in
+            guard let self else { return }
+            await self.reader.primeAccessibility(pid: pid, bundleIdentifier: app.bundleIdentifier) { [weak self] in
+                DispatchQueue.main.sync {
+                    MainActor.assumeIsolated {
+                        guard let self else { return false }
+                        return self.isEnabled && Self.isTrusted && self.primingGeneration == request
+                            && SelectionPolicy.isNotionApplication(NSRunningApplication(processIdentifier: pid)?.bundleIdentifier)
+                    }
+                }
+            }
+            if self.primingGeneration == request { self.primingTasks.removeValue(forKey: pid) }
+        }
     }
 
     func readSelection(allowClipboardFallback: Bool = true) async -> SelectedContent? {
@@ -220,8 +273,17 @@ final class SelectionMonitor {
             catch { return }
             guard let self, self.isCurrent(pid: pid, request: request),
                   !(self.shouldIgnoreEvent?() ?? false), Self.isTrusted else { return }
-            let result = await self.reader.read(pid: pid, bundleIdentifier: bundle, point: point, startPoint: startPoint)
-            guard self.isCurrent(pid: pid, request: request), !(self.shouldIgnoreEvent?() ?? false) else { return }
+            // Each AX read remains bounded. A cold Notion tree additionally
+            // gets one fresh read after Electron's activation delay, provided
+            // that the same gesture and source application are still current.
+            guard let result = await SelectionPolicy.readWithActivationRetry(read: { retryAllowed in
+                await self.reader.read(pid: pid, bundleIdentifier: bundle, point: point,
+                                       startPoint: startPoint, allowActivationRetry: retryAllowed)
+            }, retryAt: { $0.text == nil ? $0.accessibilityReadyAt : nil }, isCurrent: {
+                self.isCurrent(pid: pid, request: request) && !(self.shouldIgnoreEvent?() ?? false) && Self.isTrusted
+            }, uptime: { ProcessInfo.processInfo.systemUptime }, sleep: { delay in
+                try await Task.sleep(for: .seconds(delay))
+            }) else { return }
             if let text = result.text {
                 let identity = SelectionIdentity(text: text, pid: pid, x: Int(anchor.x / 12), y: Int(anchor.y / 12))
                 guard self.lastDelivered != identity else { return }
@@ -417,18 +479,63 @@ private final class AccessibilitySelectionReader: @unchecked Sendable {
         let canCopy: Bool
         let target: SelectionPolicy.TargetFacts
         var endpoints: [AXUIElement] = []
+        var accessibilityReadyAt: TimeInterval?
         var context: SelectionReadContext { SelectionReadContext(target: target, endpoints: endpoints) }
     }
     private let queue = DispatchQueue(label: "transpose.selection.ax", qos: .userInitiated)
     private var enabledChromiumPIDs = Set<pid_t>()
+    private var notionAccessibilityReadyAt: [pid_t: TimeInterval] = [:]
     private var activeDeadline = TimeInterval.greatestFiniteMagnitude
+    private var activeCancellation: SelectionCancellation?
 
     func read(pid: pid_t, bundleIdentifier: String?, point: CGPoint?, startPoint: CGPoint? = nil,
-              context: SelectionReadContext? = nil) async -> Result {
-        await withCheckedContinuation { continuation in
-            queue.async { [self] in
-                continuation.resume(returning: readSynchronously(pid: pid, bundleIdentifier: bundleIdentifier,
-                                                                 point: point, startPoint: startPoint, context: context))
+              context: SelectionReadContext? = nil,
+              allowActivationRetry: Bool = false) async -> Result {
+        let cancellation = SelectionCancellation()
+        return await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { continuation in
+                queue.async { [self] in
+                    continuation.resume(returning: readSynchronously(pid: pid, bundleIdentifier: bundleIdentifier,
+                                                                     point: point, startPoint: startPoint, context: context,
+                                                                     allowActivationRetry: allowActivationRetry,
+                                                                     cancellation: cancellation))
+                }
+            }
+        }, onCancel: { cancellation.cancel() })
+    }
+
+    /// Enabling Electron AX is independent from a selection gesture. This
+    /// operation never queries a window, focused element or page text.
+    func primeAccessibility(pid: pid_t, bundleIdentifier: String?,
+                            allowed: @escaping @Sendable () -> Bool) async {
+        let cancellation = SelectionCancellation()
+        await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                queue.async { [self] in
+                    defer { continuation.resume() }
+                    guard !cancellation.isCancelled, allowed(), !cancellation.isCancelled else { return }
+                    let application = AXUIElementCreateApplication(pid)
+                    AXUIElementSetMessagingTimeout(application, 0.08)
+                    activeDeadline = ProcessInfo.processInfo.systemUptime + 0.08
+                    activeCancellation = cancellation
+                    defer {
+                        activeDeadline = .greatestFiniteMagnitude
+                        activeCancellation = nil
+                    }
+                    activateManualAccessibility(application: application, pid: pid, bundleIdentifier: bundleIdentifier)
+                }
+            }
+        }, onCancel: { cancellation.cancel() })
+    }
+
+    private func activateManualAccessibility(application: AXUIElement, pid: pid_t, bundleIdentifier: String?) {
+        guard SelectionPolicy.needsManualAccessibility(bundleIdentifier), !enabledChromiumPIDs.contains(pid),
+              before(activeDeadline) else { return }
+        if AXUIElementSetAttributeValue(application, "AXManualAccessibility" as CFString, kCFBooleanTrue) == .success {
+            enabledChromiumPIDs.insert(pid)
+            if SelectionPolicy.isNotionApplication(bundleIdentifier) {
+                notionAccessibilityReadyAt[pid] = ProcessInfo.processInfo.systemUptime
+                    + SelectionPolicy.notionAccessibilityActivationDelay
             }
         }
     }
@@ -440,16 +547,22 @@ private final class AccessibilitySelectionReader: @unchecked Sendable {
     }
 
     private func readSynchronously(pid: pid_t, bundleIdentifier: String?, point: CGPoint?, startPoint: CGPoint?,
-                                   context: SelectionReadContext?) -> Result {
+                                   context: SelectionReadContext?, allowActivationRetry: Bool,
+                                   cancellation: SelectionCancellation) -> Result {
         let application = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(application, 0.08)
         let deadline = ProcessInfo.processInfo.systemUptime + 0.55
         activeDeadline = deadline
-        defer { activeDeadline = .greatestFiniteMagnitude }
-        if SelectionPolicy.needsManualAccessibility(bundleIdentifier), !enabledChromiumPIDs.contains(pid), before(deadline) {
-            if AXUIElementSetAttributeValue(application, "AXManualAccessibility" as CFString, kCFBooleanTrue) == .success {
-                enabledChromiumPIDs.insert(pid)
-            }
+        activeCancellation = cancellation
+        defer {
+            activeDeadline = .greatestFiniteMagnitude
+            activeCancellation = nil
+        }
+        activateManualAccessibility(application: application, pid: pid, bundleIdentifier: bundleIdentifier)
+        var readyAt: TimeInterval?
+        if allowActivationRetry, SelectionPolicy.isNotionApplication(bundleIdentifier),
+           let pendingReadyAt = notionAccessibilityReadyAt[pid], pendingReadyAt > ProcessInfo.processInfo.systemUptime {
+            readyAt = pendingReadyAt
         }
         // Inspect the actual gesture targets before spending time walking
         // ancestor chains. Unsupported attributes are valid for WeChat; an
@@ -466,18 +579,21 @@ private final class AccessibilitySelectionReader: @unchecked Sendable {
         facts.riskyEditable = hit.map(isRiskyEditable) ?? false
         facts.incomplete = !before(deadline)
         guard !facts.protected, !facts.windowChrome, facts.belongsToSource, !facts.incomplete else {
-            return Result(text: nil, canCopy: false, target: facts)
+            return Result(text: nil, canCopy: false, target: facts,
+                          accessibilityReadyAt: readyAt)
         }
         let focused = element(attribute: kAXFocusedUIElementAttribute, of: application)
         if hit == nil && context == nil { facts.riskyEditable = focused.map(isRiskyEditable) ?? false }
-        let hitChain = chain(from: hit, deadline: deadline)
-        let startChain = chain(from: startHit, deadline: deadline)
-        let focusedChain = chain(from: focused, deadline: deadline)
+        let ancestorLimit = SelectionPolicy.selectionAncestorLimit(bundleIdentifier)
+        let hitChain = chain(from: hit, deadline: deadline, maximumDepth: ancestorLimit)
+        let startChain = chain(from: startHit, deadline: deadline, maximumDepth: ancestorLimit)
+        let focusedChain = chain(from: focused, deadline: deadline, maximumDepth: ancestorLimit)
         facts.protected = (hitChain + startChain + focusedChain).contains(where: isProtected)
         facts.windowChrome = (hitChain + startChain).contains(where: isWindowChrome)
         facts.incomplete = !before(deadline)
         guard !facts.protected, !facts.windowChrome, !facts.incomplete else {
-            return Result(text: nil, canCopy: false, target: facts)
+            return Result(text: nil, canCopy: false, target: facts,
+                          accessibilityReadyAt: readyAt)
         }
 
         // Hit testing reaches chat message controls when focus remains in the
@@ -502,7 +618,7 @@ private final class AccessibilitySelectionReader: @unchecked Sendable {
         }
         facts.incomplete = !before(deadline)
         return Result(text: nil, canCopy: !facts.protected && !facts.windowChrome && !facts.riskyEditable && !facts.incomplete,
-                      target: facts, endpoints: directTargets)
+                      target: facts, endpoints: directTargets, accessibilityReadyAt: readyAt)
     }
 
     func allowsChatKeyboardCopy(pid: pid_t, context: SelectionReadContext) async -> Bool {
@@ -573,12 +689,14 @@ private final class AccessibilitySelectionReader: @unchecked Sendable {
         return SelectionPolicy.menuFallbackResult(searchCompleted: !truncated && before(deadline))
     }
 
-    private func before(_ deadline: TimeInterval) -> Bool { ProcessInfo.processInfo.systemUptime < deadline }
+    private func before(_ deadline: TimeInterval) -> Bool {
+        activeCancellation?.isCancelled != true && ProcessInfo.processInfo.systemUptime < deadline
+    }
 
-    private func chain(from element: AXUIElement?, deadline: TimeInterval) -> [AXUIElement] {
+    private func chain(from element: AXUIElement?, deadline: TimeInterval, maximumDepth: Int = 6) -> [AXUIElement] {
         var current = element
         var visited: [AXUIElement] = []
-        for _ in 0..<6 {
+        for _ in 0..<maximumDepth {
             guard let candidate = current, before(deadline), !visited.contains(where: { CFEqual($0, candidate) }) else { break }
             AXUIElementSetMessagingTimeout(candidate, 0.06)
             visited.append(candidate)
