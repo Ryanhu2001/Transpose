@@ -275,6 +275,17 @@ function Check-Selection([string]$Case, [string]$ExpectedText, [bool]$IsBaseline
     Save-Screenshot $script:caseOutput "$Case-before-click"
     try {
         [TransposeBrowserInput]::ClickPopup([int]($popupBounds.left + $popupBounds.width / 2), [int]($popupBounds.top + $popupBounds.height / 2), $popup)
+    } catch {
+        $clickError = $_.Exception.GetBaseException().Message
+        if ($IsBaseline -and $clickError.StartsWith("The translation button is covered by another window:")) {
+            # The baseline is observational. Record its unsafe hit target without
+            # clicking another browser action or preventing the fixed app's test.
+            $selectionCheck.clickCovered = $true
+            $selectionCheck.clickError = $clickError
+            Assert-Clipboard $sequence
+            return
+        }
+        throw
     } finally {
         $selectionCheck.clickHit = [TransposeBrowserInput]::LastPopupClickHit
         Save-Checks
