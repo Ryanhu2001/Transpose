@@ -44,6 +44,19 @@ func runSelectionChecks() throws -> Int {
     }
     checks += try require(SelectionPolicy.needsManualAccessibility("com.google.Chrome"), "Existing Chromium accessibility support")
     checks += try require(SelectionPolicy.needsManualAccessibility("com.todesktop.fixture"), "Electron accessibility support")
+    checks += try require(SelectionPolicy.needsManualAccessibility("notion.id"), "The Notion desktop client receives Electron accessibility activation")
+    checks += try require(SelectionPolicy.selectionAncestorLimit("notion.id") == 24,
+                          "Notion selection lookup can reach its deeply nested document ancestors")
+    for bundle: String? in [nil, "", "notion.id.extra", "NOTION.ID", "com.google.Chrome"] {
+        checks += try require(!SelectionPolicy.isNotionApplication(bundle)
+                              && SelectionPolicy.selectionAncestorLimit(bundle) == 6,
+                              "Notion-specific ancestry limits require its exact bundle identifier")
+    }
+    for gesture: SelectionPolicy.Gesture in [.drag(distance: 20), .keyboardSelection] {
+        checks += try require(!SelectionPolicy.permitsDeferred(bundle: "notion.id", gesture: gesture, target: safeTarget)
+                              && !SelectionPolicy.permitsExplicitChatKeyboardCopy(bundle: "notion.id", target: safeTarget),
+                              "Notion selection retries cannot enter either deferred chat-copy path")
+    }
     checks += try require(!SelectionPolicy.needsManualAccessibility("com.tencent.xinWeChat"), "WeChat is not assumed to be Chromium")
     checks += try require(!SelectionPolicy.needsManualAccessibility(nil), "Unknown bundle does not receive Chromium attributes")
 
@@ -358,5 +371,116 @@ func runSelectionDispatchChecks() async throws -> Int {
     _ = await cancelledDispatch.value
     checks += try require(cancelledDispatch.isCancelled && trace == ["down:42", "pause", "up:42"],
                           "Actual Task cancellation cannot leave the source application's copy key held down")
+    checks += try await runSelectionActivationChecks()
+    return checks
+}
+
+/// Exercises the production retry scheduler with a virtual clock and AX-shaped
+/// results. The only reads here are synthetic; no application or clipboard is used.
+@MainActor
+private final class SelectionActivationFixture {
+    struct Read {
+        let text: String?
+        let readyAt: TimeInterval?
+    }
+    var now: TimeInterval = 10
+    var first = Read(text: nil, readyAt: 10 + SelectionPolicy.notionAccessibilityActivationDelay)
+    var fresh = Read(text: "fresh Notion selection", readyAt: 15)
+    var attempts = [Bool]()
+    var readTimes = [TimeInterval]()
+    var sleeps = [TimeInterval]()
+    var currentPID: Int32? = 42
+    var generation = 9
+    let cancellation = SelectionCancellation()
+    var onSleep: (() -> Void)?
+    var onRead: ((Int) -> Void)?
+
+    func run() async -> Read? {
+        await SelectionPolicy.readWithActivationRetry(read: { allowActivationRetry in
+            self.attempts.append(allowActivationRetry)
+            self.readTimes.append(self.now)
+            self.onRead?(self.attempts.count)
+            return self.attempts.count == 1 ? self.first : self.fresh
+        }, retryAt: { $0.text == nil ? $0.readyAt : nil }, isCurrent: {
+            SelectionPolicy.isCurrent(originPID: 42, generation: 9, currentPID: self.currentPID,
+                                      currentGeneration: self.generation, enabled: true,
+                                      cancelled: self.cancellation.isCancelled)
+        }, uptime: { self.now }, sleep: { delay in
+            self.sleeps.append(delay)
+            self.now += delay
+            self.onSleep?()
+            await Task.yield()
+        })
+    }
+}
+
+@MainActor
+private func runSelectionActivationChecks() async throws -> Int {
+    struct Failure: LocalizedError {
+        let reason: String
+        var errorDescription: String? { "Selection activation: " + reason }
+    }
+    func require(_ value: @autoclosure () -> Bool, _ reason: String) throws -> Int {
+        guard value() else { throw Failure(reason: reason) }
+        return 1
+    }
+    var checks = 0
+    let cold = SelectionActivationFixture()
+    let coldResult = await cold.run()
+    checks += try require(coldResult?.text == "fresh Notion selection" && cold.attempts == [true, false],
+                          "A cold Notion read delivers the fresh retry and does not reactivate or read a third time")
+    checks += try require(cold.sleeps.count == 1 && abs(cold.sleeps[0] - 2.1) < 0.0001
+                          && cold.readTimes.count == 2 && abs(cold.readTimes[1] - 12.1) < 0.0001,
+                          "The cold retry waits for Electron's activation deadline before another AX read")
+
+    let ready = SelectionActivationFixture()
+    ready.now = 15
+    let readyResult = await ready.run()
+    checks += try require(readyResult?.text == "fresh Notion selection" && ready.attempts == [true, false]
+                          && ready.sleeps.isEmpty && ready.readTimes == [15, 15],
+                          "An activation deadline that already passed permits an immediate fresh read")
+
+    let warm = SelectionActivationFixture()
+    warm.first = .init(text: "warm Notion selection", readyAt: 12.1)
+    let warmResult = await warm.run()
+    checks += try require(warmResult?.text == "warm Notion selection" && warm.attempts == [true] && warm.sleeps.isEmpty,
+                          "An available warm selection is returned without a wait or second AX read")
+
+    let inactive = SelectionActivationFixture()
+    inactive.first = .init(text: nil, readyAt: nil)
+    let inactiveResult = await inactive.run()
+    checks += try require(inactiveResult?.text == nil && inactive.attempts == [true] && inactive.sleeps.isEmpty,
+                          "An empty read without an activation request does not start a retry loop")
+
+    let stillEmpty = SelectionActivationFixture()
+    stillEmpty.fresh = .init(text: nil, readyAt: 15)
+    _ = await stillEmpty.run()
+    checks += try require(stillEmpty.attempts == [true, false] && stillEmpty.sleeps.count == 1,
+                          "A fresh read that remains empty cannot schedule a third read or another activation wait")
+
+    let cancelled = SelectionActivationFixture()
+    cancelled.onSleep = { [weak cancelled] in cancelled?.cancellation.cancel() }
+    let cancelledResult = await cancelled.run()
+    checks += try require(cancelledResult == nil && cancelled.attempts == [true],
+                          "Cancelling a gesture during the activation wait prevents another AX read")
+
+    let superseded = SelectionActivationFixture()
+    superseded.onSleep = { [weak superseded] in superseded?.generation += 1 }
+    let supersededResult = await superseded.run()
+    checks += try require(supersededResult == nil && superseded.currentPID == 42 && superseded.attempts == [true],
+                          "A newer generation in the same Notion process cannot receive the old gesture's retry")
+
+    let switched = SelectionActivationFixture()
+    switched.onRead = { [weak switched] attempt in if attempt == 2 { switched?.currentPID = 77 } }
+    let switchedResult = await switched.run()
+    checks += try require(switchedResult == nil && switched.attempts == [true, false],
+                          "Changing applications while the fresh AX read completes discards its result")
+
+    let taskCancelled = SelectionActivationFixture()
+    taskCancelled.onSleep = { withUnsafeCurrentTask { $0?.cancel() } }
+    let task = Task { @MainActor in await taskCancelled.run() }
+    let taskResult = await task.value
+    checks += try require(task.isCancelled && taskResult == nil && taskCancelled.attempts == [true],
+                          "Actual Swift Task cancellation prevents the cold activation retry")
     return checks
 }
