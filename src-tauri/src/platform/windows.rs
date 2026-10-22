@@ -47,6 +47,9 @@ static CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static SELECTION_LAUNCHER: AtomicUsize = AtomicUsize::new(0);
 static SELECTION_READS: AtomicU64 = AtomicU64::new(0);
 static SELECTION_REASON: AtomicUsize = AtomicUsize::new(0);
+static LAUNCHER_PRESSED: AtomicBool = AtomicBool::new(false);
+static LAUNCHER_DOWNS: AtomicU64 = AtomicU64::new(0);
+static LAUNCHER_UPS: AtomicU64 = AtomicU64::new(0);
 const START_CAPTURE: u32 = 0x8001;
 const CLEAR_OUTLINE: u32 = 0x8002;
 const SELECTED: u32 = 0x8003;
@@ -287,6 +290,7 @@ unsafe extern "system" {
     fn LoadCursorW(instance: Handle, name: *const u16) -> Handle;
     fn SetCursor(cursor: Handle) -> Handle;
     fn SetCapture(hwnd: Handle) -> Handle;
+    fn GetCapture() -> Handle;
     fn ReleaseCapture() -> i32;
     fn InvalidateRect(hwnd: Handle, rect: *const Rect, erase: i32) -> i32;
     fn BeginPaint(hwnd: Handle, paint: *mut Paint) -> Handle;
@@ -522,7 +526,10 @@ pub fn selection_test_snapshot() -> serde_json::Value {
         "launcher": {"hwnd":hwnd.to_string(),"visible":visible,
             "left":rect.left,"top":rect.top,"right":rect.right,"bottom":rect.bottom},
         "reason":reason,"requests":SELECTION_READS.load(Ordering::Acquire),
-        "generation":GENERATION.load(Ordering::Acquire)
+        "generation":GENERATION.load(Ordering::Acquire),
+        "buttonDowns":LAUNCHER_DOWNS.load(Ordering::Acquire),
+        "buttonUps":LAUNCHER_UPS.load(Ordering::Acquire),
+        "buttonPressed":LAUNCHER_PRESSED.load(Ordering::Acquire)
     })
 }
 pub fn ocr_languages() -> Vec<String> {
@@ -1189,7 +1196,10 @@ unsafe extern "system" fn controller_proc(
                 STATE.with(|cell| {
                     if let Some(state) = cell.borrow_mut().as_mut() {
                         let size = (30 * GetDpiForWindow(selection.foreground).max(96) / 96) as i32;
-                        let (mut x, mut y) = (selection.anchor.0 + 12, selection.anchor.1 + 12);
+                        // Browsers can place their own selection menu to the
+                        // right. Keep our compact action below the left side
+                        // of the pointer instead of overlapping those actions.
+                        let (mut x, mut y) = (selection.anchor.0 - size - 12, selection.anchor.1 + 12);
                         let monitor = MonitorFromPoint(Point { x, y }, 2);
                         let mut info = MonitorInfo {
                             size: size_of::<MonitorInfo>() as u32,
@@ -1303,7 +1313,35 @@ unsafe extern "system" fn launcher_proc(
 ) -> isize {
     match message {
         0x21 => return 3, // MA_NOACTIVATE: retain the source application's selection.
+        0x201 | 0x203 => {
+            // Own the complete press. A mouse-up can otherwise arrive after
+            // another app's transient selection menu handled the mouse-down.
+            LAUNCHER_PRESSED.store(true, Ordering::Release);
+            if selection_test_enabled() {
+                LAUNCHER_DOWNS.fetch_add(1, Ordering::AcqRel);
+            }
+            SetCapture(hwnd);
+            return 0;
+        }
         0x202 => {
+            if selection_test_enabled() {
+                LAUNCHER_UPS.fetch_add(1, Ordering::AcqRel);
+            }
+            let pressed = LAUNCHER_PRESSED.swap(false, Ordering::AcqRel);
+            let point = unpack_point(lparam);
+            let mut bounds = Rect::default();
+            let inside = GetClientRect(hwnd, &mut bounds) != 0
+                && point.x >= bounds.left && point.x < bounds.right
+                && point.y >= bounds.top && point.y < bounds.bottom;
+            // ReleaseCapture can synchronously call this window procedure.
+            // Do it before borrowing STATE and handle that notification below
+            // without borrowing the controller's RefCell again.
+            if GetCapture() == hwnd {
+                ReleaseCapture();
+            }
+            if !pressed || !inside {
+                return 0;
+            }
             let action = STATE.with(|cell| {
                 let mut state = cell.borrow_mut();
                 let state = state.as_mut()?;
@@ -1315,6 +1353,13 @@ unsafe extern "system" fn launcher_proc(
             });
             if let Some((callback, selection)) = action {
                 callback(selection.text, selection.app, selection.anchor);
+            }
+            return 0;
+        }
+        0x215 | 0x1f => {
+            LAUNCHER_PRESSED.store(false, Ordering::Release);
+            if message == 0x1f && GetCapture() == hwnd {
+                ReleaseCapture();
             }
             return 0;
         }

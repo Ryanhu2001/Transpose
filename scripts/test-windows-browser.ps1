@@ -27,6 +27,10 @@ public static class TransposeBrowserInput {
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT { public int Left, Top, Right, Bottom; }
     [StructLayout(LayoutKind.Sequential)]
+    struct POINT { public int X, Y; }
+    public sealed class WindowHit { public string hwnd, rootHwnd, rootOwnerHwnd, className; public uint pid; }
+    public static WindowHit LastPopupClickHit { get; private set; }
+    [StructLayout(LayoutKind.Sequential)]
     struct MOUSEINPUT { public int dx, dy; public uint mouseData, dwFlags, time; public UIntPtr dwExtraInfo; }
     [StructLayout(LayoutKind.Sequential)]
     struct KEYBDINPUT { public ushort wVk, wScan; public uint dwFlags, time; public UIntPtr dwExtraInfo; }
@@ -41,6 +45,8 @@ public static class TransposeBrowserInput {
     [DllImport("user32.dll", SetLastError = true)] static extern uint SendInput(uint count, INPUT[] inputs, int size);
     [DllImport("user32.dll", SetLastError = true)] static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowProc callback, IntPtr parameter);
+    [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT point);
+    [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hwnd, StringBuilder text, int length);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr hwnd, StringBuilder text, int length);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
@@ -90,6 +96,25 @@ public static class TransposeBrowserInput {
     public static void Click(int x, int y) {
         if (!SetCursorPos(x, y)) throw new InvalidOperationException("SetCursorPos failed.");
         Thread.Sleep(80); Mouse(0x0002);
+        try { Thread.Sleep(70); } finally { Mouse(0x0004); }
+    }
+    public static void ClickPopup(int x, int y, IntPtr expected) {
+        LastPopupClickHit = null;
+        if (!SetCursorPos(x, y)) throw new InvalidOperationException("SetCursorPos failed.");
+        Thread.Sleep(80); // Allow the browser's selection menu to react to hovering.
+        var hit = WindowFromPoint(new POINT { X = x, Y = y });
+        var root = GetAncestor(hit, 2);
+        var owner = GetAncestor(hit, 3);
+        var className = new StringBuilder(256);
+        GetClassName(hit, className, className.Capacity);
+        uint pid;
+        GetWindowThreadProcessId(hit, out pid);
+        LastPopupClickHit = new WindowHit { hwnd = hit.ToInt64().ToString(), rootHwnd = root.ToInt64().ToString(), rootOwnerHwnd = owner.ToInt64().ToString(), className = className.ToString(), pid = pid };
+        var expectedClass = new StringBuilder(256);
+        GetClassName(expected, expectedClass, expectedClass.Capacity);
+        if (expectedClass.ToString() != "TransposeSelection" || (hit != expected && root != expected && owner != expected))
+            throw new InvalidOperationException("The translation button is covered by another window: " + className + " (PID " + pid + ", HWND " + hit + ").");
+        Mouse(0x0002);
         try { Thread.Sleep(70); } finally { Mouse(0x0004); }
     }
     public static void Drag(int fromX, int fromY, int toX, int toY) {
@@ -168,21 +193,27 @@ function Activate-Browser {
     [TransposeBrowserInput]::SetForegroundWindow($script:browserHandle) | Out-Null
     Wait-For { [TransposeBrowserInput]::GetForegroundWindow() -eq $script:browserHandle } "the browser to become foreground"
 }
+function Assert-FixtureActive([string]$Context) {
+    Wait-For { $m = Read-Json $script:metricsPath; $m.visibilityState -eq 'visible' -and $m.hasFocus -eq $true } "the original fixture to be visible and focused $Context"
+}
 function Clear-Selection {
     Activate-Browser
+    Wait-For { $m = Read-Json $script:metricsPath; $m.visibilityState -eq 'visible' } "the original fixture to remain visible before clearing the selection"
     $blank = Browser-Point 12 14
     [TransposeBrowserInput]::Click($blank.X, $blank.Y)
     Start-Sleep -Milliseconds 650
     Wait-For { (Popup-Handle) -eq [IntPtr]::Zero } "the previous selection button to hide"
+    Assert-FixtureActive "after clearing the selection"
 }
 function Check-Selection([string]$Case, [string]$ExpectedText, [bool]$IsBaseline) {
     $before = Read-Json $script:diagnosticsPath
     $callbackCount = if ($before) { [int]$before.selectionCallbacks } else { 0 }
     $sequence = [TransposeBrowserInput]::GetClipboardSequenceNumber()
+    Activate-Browser
+    Assert-FixtureActive "before the $Case selection"
     $metrics = Read-Json $script:metricsPath
     $rectangle = $metrics.rectangles.$Case
     if (-not $rectangle -or $rectangle.width -le 0) { throw "The page omitted the $Case layout." }
-    Activate-Browser
     if ($Case -eq "editable") {
         $inside = Browser-Point ($rectangle.x + 20) ($rectangle.y + $rectangle.height / 2)
         [TransposeBrowserInput]::Click($inside.X, $inside.Y)
@@ -229,20 +260,45 @@ function Check-Selection([string]$Case, [string]$ExpectedText, [bool]$IsBaseline
     $selectionCheck.popupBounds = $popupBounds
     $expectedSize = 30 * [TransposeBrowserInput]::GetDpiForWindow($script:browserHandle) / 96
     if ([Math]::Abs($popupBounds.width - $expectedSize) -gt 2 -or [Math]::Abs($popupBounds.height - $expectedSize) -gt 2) { throw "The browser selection popup has the wrong size." }
-    if ([Math]::Abs($popupBounds.left - $endpoint.X - 12) -gt 18 -or [Math]::Abs($popupBounds.top - $endpoint.Y - 12) -gt 18) { throw "The browser selection popup is not near the selected text." }
+    $work = [System.Windows.Forms.Screen]::FromHandle($script:browserHandle).WorkingArea
+    $buttonSize = [int][Math]::Floor($expectedSize)
+    $rawLeft = if ($IsBaseline) { $endpoint.X + 12 } else { $endpoint.X - $buttonSize - 12 }
+    $expectedLeft = [Math]::Clamp($rawLeft, $work.Left, $work.Right - $buttonSize)
+    $expectedTop = [Math]::Clamp($endpoint.Y + 12, $work.Top, $work.Bottom - $buttonSize)
+    $selectionCheck.expectedPopupPosition = @{ left = $expectedLeft; top = $expectedTop; clamped = $expectedLeft -ne $rawLeft -or $expectedTop -ne $endpoint.Y + 12 }
+    if ([Math]::Abs($popupBounds.left - $expectedLeft) -gt 18 -or [Math]::Abs($popupBounds.top - $expectedTop) -gt 18) { throw "The browser selection popup is not in its expected position beside the selected text." }
     if ([TransposeBrowserInput]::GetForegroundWindow() -ne $script:browserHandle) { throw "The selection popup stole browser focus." }
     $selectionCheck.popup = $true
-    Save-Screenshot $script:caseOutput "$Case-button"
-    [TransposeBrowserInput]::Click([int]($popupBounds.left + $popupBounds.width / 2), [int]($popupBounds.top + $popupBounds.height / 2))
+    $beforeClick = Read-Json $script:diagnosticsPath
+    $fixtureBeforeClick = Read-Json $script:metricsPath
+    $selectionCheck.fixtureBeforeClick = @{ visibilityState = $fixtureBeforeClick.visibilityState; hasFocus = $fixtureBeforeClick.hasFocus }
+    Save-Screenshot $script:caseOutput "$Case-before-click"
+    try {
+        [TransposeBrowserInput]::ClickPopup([int]($popupBounds.left + $popupBounds.width / 2), [int]($popupBounds.top + $popupBounds.height / 2), $popup)
+    } finally {
+        $selectionCheck.clickHit = [TransposeBrowserInput]::LastPopupClickHit
+        Save-Checks
+        Save-Screenshot $script:caseOutput "$Case-after-click"
+    }
     Wait-For { (Popup-Handle) -eq [IntPtr]::Zero } "the $Case button click"
     $selectionCheck.clicked = $true
     if (-not $IsBaseline) {
         Wait-For { $d = Read-Json $script:diagnosticsPath; $d.selectionCallbacks -eq $callbackCount + 1 -and $d.lastSelectionMatch -eq $true -and $d.lastSelectionCase -eq $Case -and $d.resultFixtureShown -eq $true } "the $Case selection to reach the local result fixture"
         $d = Read-Json $script:diagnosticsPath
         if ($d.networkRequests -ne 0 -or $d.unexpectedSelection -eq $true) { throw "The local browser fixture used an unexpected selection or network translation." }
+        $selectionCheck.nativeButtonPress = @{
+            downEvents = [int]$d.platform.buttonDowns - [int]$beforeClick.platform.buttonDowns
+            upEvents = [int]$d.platform.buttonUps - [int]$beforeClick.platform.buttonUps
+            pressedAtEnd = $d.platform.buttonPressed
+        }
+        if ($selectionCheck.nativeButtonPress.downEvents -lt 1 -or $selectionCheck.nativeButtonPress.upEvents -lt 1 -or $selectionCheck.nativeButtonPress.pressedAtEnd -ne $false) {
+            throw "The translation button did not receive a complete native press and release."
+        }
         $selectionCheck.textMatched = $true
         $selectionCheck.resultShown = $true
     }
+    $afterClick = Read-Json $script:metricsPath
+    $selectionCheck.fixtureAfterClick = @{ visibilityState = $afterClick.visibilityState; hasFocus = $afterClick.hasFocus }
     Assert-Clipboard $sequence
     Save-Checks
 }
@@ -278,10 +334,11 @@ function report() {
  const rectangles = {};
  for (const id of ['cold','warm','editable','password']) { const r = document.getElementById(id).getBoundingClientRect(); rectangles[id] = {x:r.x,y:r.y,width:r.width,height:r.height}; }
  const selectedText = password ? null : input ? active.value.substring(active.selectionStart, active.selectionEnd) : String(window.getSelection());
- const metrics = {ready:true,innerWidth,innerHeight,outerWidth,outerHeight,dpr:devicePixelRatio,rectangles,activeControl:active?.id || null,selectedText,selectedLength:password?active.selectionEnd-active.selectionStart:null};
+ const metrics = {ready:true,visibilityState:document.visibilityState,hasFocus:document.hasFocus(),innerWidth,innerHeight,outerWidth,outerHeight,dpr:devicePixelRatio,rectangles,activeControl:active?.id || null,selectedText,selectedLength:password?active.selectionEnd-active.selectionStart:null};
  fetch('/event/${id}', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(metrics),keepalive:true}).catch(()=>{});
 }
-for (const event of ['selectionchange','mouseup','keyup','resize']) addEventListener(event, report);
+for (const event of ['selectionchange','mouseup','keyup','resize','focus','blur']) addEventListener(event, report);
+document.addEventListener('visibilitychange', report);
 setInterval(report,250); report();
 </script></html>`;
 }
